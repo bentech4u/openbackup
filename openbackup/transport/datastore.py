@@ -79,9 +79,12 @@ class DatastoreTransport:
                 sess.auth = self.auth
             if self.cookie:
                 sess.headers["Cookie"] = self.cookie
+            # 500 is deliberately absent: vCenter uses it for permanent
+            # conditions such as a missing file or an unreadable disk layout,
+            # and retrying those only delays and obscures the real error.
             retry = Retry(
                 total=4, backoff_factor=0.5,
-                status_forcelist=(429, 500, 502, 503, 504),
+                status_forcelist=(429, 502, 503, 504),
                 allowed_methods=frozenset(["GET", "HEAD", "PUT"]),
             )
             adapter = HTTPAdapter(max_retries=retry, pool_maxsize=self.max_workers)
@@ -127,8 +130,12 @@ class DatastoreBlockDevice(BlockDevice):
     # -- metadata -----------------------------------------------------------
 
     def _fetch_size(self) -> int:
-        resp = self._t.session().head(
-            self.url, timeout=self._t.timeout, allow_redirects=True)
+        try:
+            resp = self._t.session().head(
+                self.url, timeout=self._t.timeout, allow_redirects=True)
+        except requests.RequestException as exc:
+            raise TransportError(
+                f"could not reach {self.url}: {_describe(exc)}") from exc
         if resp.status_code == 404:
             raise TransportError(f"datastore file not found: {self.url}")
         if resp.status_code in (401, 403):
@@ -136,6 +143,12 @@ class DatastoreBlockDevice(BlockDevice):
                 f"not authorised to read {self.url} (status {resp.status_code}); "
                 "the account needs Datastore > Browse datastore and "
                 "Low level file operations"
+            )
+        if resp.status_code == 500:
+            raise TransportError(
+                f"datastore returned 500 for {self.url}. The file may not "
+                "exist under that name, or the disk may not be stored as a "
+                "single flat extent (snapshots, or a non-flat format)"
             )
         if resp.status_code >= 400:
             raise TransportError(
@@ -156,12 +169,17 @@ class DatastoreBlockDevice(BlockDevice):
 
     def _range_get(self, sess: requests.Session, offset: int, length: int) -> bytes:
         last = offset + length - 1
-        resp = sess.get(
-            self.url,
-            headers={"Range": f"bytes={offset}-{last}"},
-            timeout=self._t.timeout,
-            stream=True,
-        )
+        try:
+            resp = sess.get(
+                self.url,
+                headers={"Range": f"bytes={offset}-{last}"},
+                timeout=self._t.timeout,
+                stream=True,
+            )
+        except requests.RequestException as exc:
+            raise TransportError(
+                f"range read {offset}+{length} failed: {_describe(exc)}"
+            ) from exc
         try:
             # A server that does not honour Range answers 200 with the entire
             # file. Silently accepting that would both blow up memory and put
@@ -272,13 +290,17 @@ class DatastoreBlockDevice(BlockDevice):
                     f"stream supplied {sent} bytes, declared {total}"
                 )
 
-        resp = self._t.session().put(
-            self.url,
-            data=body(),
-            headers={"Content-Type": "application/octet-stream",
-                     "Content-Length": str(total)},
-            timeout=self._t.timeout,
-        )
+        try:
+            resp = self._t.session().put(
+                self.url,
+                data=body(),
+                headers={"Content-Type": "application/octet-stream",
+                         "Content-Length": str(total)},
+                timeout=self._t.timeout,
+            )
+        except requests.RequestException as exc:
+            raise TransportError(
+                f"upload to {self.url} failed: {_describe(exc)}") from exc
         if resp.status_code >= 400:
             raise TransportError(
                 f"PUT {self.url} failed with status {resp.status_code}: "
@@ -297,3 +319,19 @@ class DatastoreBlockDevice(BlockDevice):
 
     def close(self) -> None:
         self._closed = True
+
+
+def _describe(exc: Exception) -> str:
+    """Flatten requests/urllib3 exception chains into one readable line.
+
+    A retry failure nests MaxRetryError inside RetryError inside
+    ConnectionError; printing that raw buries the cause several frames down.
+    """
+    seen = []
+    cur: BaseException | None = exc
+    while cur is not None and len(seen) < 5:
+        text = str(cur).strip()
+        if text and text not in seen:
+            seen.append(text)
+        cur = cur.__cause__ or cur.__context__
+    return seen[-1] if seen else type(exc).__name__
