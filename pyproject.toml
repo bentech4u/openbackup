@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "openbackup"
 version = "0.1.0"
@@ -10,6 +14,11 @@ dependencies = [
     "rich>=13.0",
     "cryptography>=42.0",
 ]
+
+[tool.setuptools.packages.find]
+# Explicit, because the working tree also holds directories that are not
+# packages (a downloaded SDK, tests, docs).
+include = ["openbackup*"]
 
 [project.scripts]
 openbackup = "openbackup.cli:main"
