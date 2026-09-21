@@ -19,7 +19,9 @@ from rich.table import Table
 from .config import EXAMPLE_CONFIG, Config, ConfigError
 from .jobs.backup import BackupJob
 from .jobs.restore import RestoreToFile, verify_point
+from .repo.gc import collect_garbage
 from .repo.index import rebuild
+from .repo.retention import RetentionPolicy, apply as apply_retention
 from .repo.repository import open_repository
 from .repo.restorepoint import PointStore
 from .transport.directnfs import DirectNfsTransport
@@ -367,6 +369,50 @@ def restore(ctx: Context, point_id, to_dir):
         repo.close()
 
 
+@main.command()
+@click.argument("vm", required=False)
+@click.option("--keep-last", type=int, default=None, help="Keep the N newest points.")
+@click.option("--keep-daily", type=int, default=None)
+@click.option("--keep-weekly", type=int, default=None)
+@click.option("--keep-monthly", type=int, default=None)
+@click.option("--keep-yearly", type=int, default=None)
+@click.option("--dry-run", is_flag=True, help="Show what would be removed.")
+@click.pass_obj
+def forget(ctx: Context, vm, keep_last, keep_daily, keep_weekly, keep_monthly,
+           keep_yearly, dry_run):
+    """Expire restore points under a retention policy.
+
+    This removes metadata only. Run `openbackup repo gc` afterwards to
+    reclaim the space, once you are satisfied with what was expired.
+    """
+    policy = RetentionPolicy(keep_last=keep_last, keep_daily=keep_daily,
+                             keep_weekly=keep_weekly, keep_monthly=keep_monthly,
+                             keep_yearly=keep_yearly)
+    if not policy.keeps_anything:
+        fail("specify at least one --keep-* option; a policy that keeps "
+             "nothing would delete every backup")
+
+    repository = ctx.open_repo()
+    try:
+        store = PointStore(repository.backend)
+        for vm_uuid in store.list_vms():
+            points_here = store.list_points(vm_uuid)
+            if not points_here:
+                continue
+            name = store.load(vm_uuid, points_here[0]).vm_name
+            if vm and vm.lower() not in name.lower():
+                continue
+            kept, expired = apply_retention(store, vm_uuid, policy,
+                                            dry_run=dry_run)
+            verb = "would expire" if dry_run else "expired"
+            console.print(f"[bold]{name}[/]: keeping {len(kept)}, "
+                          f"{verb} {len(expired)}")
+            for point in expired:
+                console.print(f"    {point.id}  {point.created_at}")
+    finally:
+        repository.close()
+
+
 # -- repository maintenance -------------------------------------------------
 
 @main.group()
@@ -405,6 +451,31 @@ def repo_reindex(ctx: Context):
         console.print(f"indexed {packs} pack(s), "
                       f"{repository.index.chunk_count()} chunks in "
                       f"{time.monotonic() - started:.1f}s")
+    finally:
+        repository.close()
+
+
+@repo.command("gc")
+@click.option("--dry-run", is_flag=True, help="Report what would be freed.")
+@click.option("--repack-below", default=0.5, show_default=True,
+              help="Rewrite a pack when this fraction or less is still live.")
+@click.pass_obj
+def repo_gc(ctx: Context, dry_run, repack_below):
+    """Reclaim space no restore point references any more."""
+    repository = ctx.open_repo()
+    try:
+        result = collect_garbage(repository, repack_below=repack_below,
+                                 dry_run=dry_run)
+        verb = "would free" if dry_run else "freed"
+        console.print(f"  live chunks     {result.live_chunks}")
+        console.print(f"  packs examined  {result.packs_examined}")
+        console.print(f"  packs deleted   {result.packs_deleted}")
+        console.print(f"  packs rewritten {result.packs_repacked} "
+                      f"(-> {result.packs_written} new)")
+        if result.orphans_removed:
+            console.print(f"  stale index entries removed "
+                          f"{result.orphans_removed}")
+        console.print(f"  [bold]{verb} {human(result.bytes_reclaimed)}[/]")
     finally:
         repository.close()
 

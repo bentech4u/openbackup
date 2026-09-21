@@ -145,6 +145,57 @@ class ChunkIndex:
         with self._db:
             self._db.execute("DELETE FROM packs WHERE pack_id = ?", (pack_id,))
 
+    # -- garbage collection support ----------------------------------------
+
+    def create_live_set(self) -> None:
+        """Start a fresh set of chunks that are still referenced.
+
+        Held in SQLite rather than a Python set: a large repository can hold
+        hundreds of millions of chunks, and 32 bytes each adds up to more than
+        we should assume fits in memory.
+        """
+        self._db.execute("DROP TABLE IF EXISTS live")
+        self._db.execute("CREATE TEMP TABLE live (hash BLOB PRIMARY KEY)")
+
+    def add_live(self, digests: Iterable[bytes]) -> None:
+        self._db.executemany(
+            "INSERT OR IGNORE INTO live(hash) VALUES(?)",
+            [(d,) for d in digests],
+        )
+
+    def drop_live_set(self) -> None:
+        self._db.execute("DROP TABLE IF EXISTS live")
+
+    def pack_liveness(self) -> list[tuple[str, int, int, int]]:
+        """(pack_id, size, total chunks, live chunks) for every pack."""
+        rows = self._db.execute(
+            """
+            SELECT p.pack_id, p.size, p.chunk_count,
+                   (SELECT COUNT(*) FROM chunks c
+                     JOIN live l ON l.hash = c.hash
+                    WHERE c.pack_id = p.pack_id)
+              FROM packs p
+            """
+        ).fetchall()
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def live_chunks_in(self, pack_id: str) -> list[tuple[bytes, int, int]]:
+        """(hash, offset, length) for the still-referenced chunks in a pack."""
+        rows = self._db.execute(
+            """
+            SELECT c.hash, c.offset, c.length
+              FROM chunks c JOIN live l ON l.hash = c.hash
+             WHERE c.pack_id = ?
+             ORDER BY c.offset
+            """,
+            (pack_id,),
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    def orphan_packs(self, present: set[str]) -> set[str]:
+        """Packs the index knows about that are no longer in the repository."""
+        return self.known_packs() - present
+
     def clear(self) -> None:
         with self._db:
             self._db.execute("DELETE FROM chunks")
