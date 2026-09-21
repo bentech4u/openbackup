@@ -3,5 +3,20 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.egg-info/
+
+# Credentials and local state - never commit these
+lab.env
+*.env
+!example.env
+secrets/
+*.key
+*.pem
+
+# Local, rebuildable index caches
+index/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 /repo-test/
 /vddk/
