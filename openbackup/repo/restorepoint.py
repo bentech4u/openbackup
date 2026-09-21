@@ -133,12 +133,18 @@ class PointStore:
         it is written last: a crash leaves orphaned block maps, never a restore
         point pointing at maps that were never written.
         """
+        # Keyed on the instance UUID, not the BIOS UUID. A BIOS UUID can be
+        # duplicated across cloned VMs, and every reader looks points up by
+        # instance UUID -- writing them under a different key would mean a
+        # point could never be found again as a parent, silently turning every
+        # backup into a full.
+        vm_key = point.vm_instance_uuid
         for key, bm in blockmaps.items():
             bm.validate()
             self.backend.write(
-                self.blockmap_path(point.vm_uuid, point.id, key), bm.to_bytes())
+                self.blockmap_path(vm_key, point.id, key), bm.to_bytes())
         self.backend.write(
-            self.point_path(point.vm_uuid, point.id), point.to_json())
+            self.point_path(vm_key, point.id), point.to_json())
 
     # -- reading ------------------------------------------------------------
 
