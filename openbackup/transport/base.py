@@ -53,6 +53,27 @@ class BlockDevice(ABC):
     def pread(self, offset: int, length: int) -> bytes:
         """Read exactly `length` bytes at `offset`."""
 
+    #: Largest whole-file read allowed. Descriptors are a few hundred bytes;
+    #: this refuses to pull a disk extent into memory by accident.
+    MAX_WHOLE_FILE = 8 * 1024 * 1024
+
+    def read_all(self) -> bytes:
+        """Read a whole small file, such as a VMDK descriptor."""
+        if self.size > self.MAX_WHOLE_FILE:
+            raise TransportError(
+                f"{self.size} bytes is too large for a whole-file read "
+                f"(limit {self.MAX_WHOLE_FILE})")
+        return self.pread(0, self.size)
+
+    def allocated_extents(self) -> list[tuple[int, int]] | None:
+        """Regions holding real data, or None if this backend cannot tell.
+
+        None and an empty list mean different things: "cannot detect holes"
+        versus "the disk is entirely holes". Conflating them would skip live
+        data, so backends that do not know must return None.
+        """
+        return None
+
     def pread_batch(self, ranges: Iterable[tuple[int, int]]) -> list[bytes]:
         """Read several disjoint ranges.
 

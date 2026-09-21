@@ -185,9 +185,26 @@ class DatastoreBlockDevice(BlockDevice):
             # file. Silently accepting that would both blow up memory and put
             # the wrong bytes at this offset, so treat it as fatal.
             if resp.status_code == 200:
+                # RFC 7233 lets a server ignore Range and return the whole
+                # entity. That is harmless when the request covered a small
+                # whole file anyway, and catastrophic on a disk extent, where
+                # it would stream hundreds of gigabytes per block read. Accept
+                # only the first case, and only when the body is small enough
+                # that we have not already paid for the mistake.
+                body_len = int(resp.headers.get("Content-Length") or 0)
+                if (offset == 0 and length >= self.size
+                        and 0 < body_len <= self.MAX_WHOLE_FILE
+                        and body_len >= length):
+                    data = resp.content[:length]
+                    if len(data) != length:
+                        raise TransportError(
+                            f"whole-file response gave {len(data)} bytes, "
+                            f"expected {length}")
+                    return data
                 raise TransportError(
                     f"datastore ignored the Range header for {self.url} "
-                    f"(returned the whole file); refusing to guess at offsets"
+                    f"(returned the whole file, {body_len} bytes); refusing to "
+                    "guess at offsets"
                 )
             if resp.status_code != 206:
                 raise TransportError(
@@ -221,6 +238,34 @@ class DatastoreBlockDevice(BlockDevice):
                 f"datastore returned bytes {start}-{end} but we asked for "
                 f"{offset}-{last}"
             )
+
+    #: Largest whole-file GET we will perform. Descriptors are a few hundred
+    #: bytes; this is generous while still refusing to pull a disk extent.
+    MAX_WHOLE_FILE = 8 * 1024 * 1024
+
+    def read_all(self) -> bytes:
+        """Fetch the entire file, for small metadata such as a VMDK descriptor.
+
+        Range is not used at all here. Asking for a range that covers a whole
+        file invites a 200 response, which RFC 7233 permits and which the
+        ranged path must treat as fatal -- accepting it on a 350 GB extent
+        would stream the whole disk for every block read.
+        """
+        self._check_open()
+        if self.size > self.MAX_WHOLE_FILE:
+            raise TransportError(
+                f"{self.url} is {self.size} bytes; refusing a whole-file read "
+                f"above {self.MAX_WHOLE_FILE}"
+            )
+        try:
+            resp = self._t.session().get(self.url, timeout=self._t.timeout)
+        except requests.RequestException as exc:
+            raise TransportError(
+                f"could not read {self.url}: {_describe(exc)}") from exc
+        if resp.status_code != 200:
+            raise TransportError(
+                f"GET {self.url} failed with status {resp.status_code}")
+        return resp.content
 
     def pread_batch(self, ranges: Iterable[tuple[int, int]]) -> list[bytes]:
         """Fetch several extents at once.

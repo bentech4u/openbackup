@@ -159,3 +159,46 @@ def test_missing_file_reports_clearly():
 def test_transport_requires_credentials():
     with pytest.raises(ValueError, match="cookie or basic-auth"):
         DatastoreTransport("vc.lab")
+
+
+# -- whole-file reads -------------------------------------------------------
+
+def test_read_all_fetches_a_small_file(disk):
+    """Descriptors are read whole; Range is not involved at all."""
+    srv, data = disk
+    dev = make_device(srv)
+    assert dev.read_all() == data
+
+
+def test_read_all_refuses_a_disk_sized_file(disk):
+    srv, _ = disk
+    dev = make_device(srv)
+    dev.size = 64 * 1024 * 1024 * 1024
+    with pytest.raises(TransportError, match="refusing a whole-file read"):
+        dev.read_all()
+
+
+def test_whole_file_range_on_a_small_file_is_accepted():
+    """RFC 7233 lets a server answer 200 to a Range it chooses to ignore.
+    Harmless when the request covered the whole of a small file -- which is
+    exactly what vCenter does for VMDK descriptors."""
+    data = os.urandom(554)
+    srv = FakeDatastore(data, ignore_range=True)
+    try:
+        dev = make_device(srv)
+        assert dev.pread(0, len(data)) == data
+    finally:
+        srv.stop()
+
+
+def test_whole_file_response_is_still_refused_for_a_partial_range():
+    """The dangerous case: a 200 for a slice of a large file would mean
+    streaming the entire disk for every block we read."""
+    data = os.urandom(256 * 1024)
+    srv = FakeDatastore(data, ignore_range=True)
+    try:
+        dev = make_device(srv)
+        with pytest.raises(TransportError, match="ignored the Range header"):
+            dev.pread(0, 4096)
+    finally:
+        srv.stop()
