@@ -1,130 +1,13 @@
-"""Tests for the backup format: chunk storage and block maps."""
+"""Tests for block maps: what a restore point actually records."""
 
 import os
 
 import pytest
 
 from openbackup.repo.blockmap import BlockMap, BlockMapError, DEFAULT_CHUNK_SIZE
-from openbackup.repo.chunkstore import (
-    ChunkCorruption, ChunkMissing, ChunkStore, chunk_hash, HASH_BYTES,
-)
+from openbackup.repo.codec import HASH_BYTES, chunk_hash
 
 MIB = 1024 * 1024
-
-
-@pytest.fixture
-def store(tmp_path):
-    cs = ChunkStore(tmp_path / "chunks")
-    cs.init()
-    return cs
-
-
-# -- chunk store ------------------------------------------------------------
-
-def test_roundtrip_preserves_contents(store):
-    data = os.urandom(64 * 1024)
-    res = store.put(data)
-    assert store.get(res.hash) == data
-
-
-def test_identical_blocks_are_stored_once(store):
-    data = os.urandom(32 * 1024)
-    first, second = store.put(data), store.put(data)
-    assert first.hash == second.hash
-    assert first.is_new and not second.is_new
-    assert sum(1 for _ in store.iter_hashes()) == 1
-
-
-def test_zero_blocks_collapse(store):
-    """Unallocated space in a thin disk is the most common block there is."""
-    res = store.put(b"\0" * MIB)
-    assert res.stored_size < 1024
-
-
-def test_incompressible_blocks_are_not_inflated(store):
-    """Already-compressed guest data must not pay a compression penalty."""
-    data = os.urandom(MIB)
-    res = store.put(data)
-    assert res.stored_size < len(data) + 64
-    assert store.get(res.hash) == data
-
-
-def test_empty_block_roundtrips(store):
-    res = store.put(b"")
-    assert store.get(res.hash) == b""
-
-
-def test_missing_chunk_raises(store):
-    with pytest.raises(ChunkMissing):
-        store.get(chunk_hash(b"never stored"))
-
-
-def test_bitrot_is_detected_not_returned(store):
-    """Silently restoring altered blocks is worse than failing loudly."""
-    data = os.urandom(8192)
-    res = store.put(data)
-    path = store.path_for(res.hash)
-    blob = bytearray(path.read_bytes())
-    blob[-1] ^= 0xFF
-    path.write_bytes(blob)
-    with pytest.raises(ChunkCorruption):
-        store.get(res.hash)
-
-
-def test_truncated_chunk_file_is_detected(store):
-    res = store.put(os.urandom(8192))
-    path = store.path_for(res.hash)
-    path.write_bytes(path.read_bytes()[:8])
-    with pytest.raises(ChunkCorruption):
-        store.get(res.hash)
-
-
-def test_delete_removes_the_chunk(store):
-    res = store.put(b"transient")
-    assert store.delete(res.hash) is True
-    assert not store.exists(res.hash)
-    assert store.delete(res.hash) is False
-
-
-def test_a_failed_put_leaves_no_partial_chunk(store, monkeypatch):
-    """A crash mid-backup must not leave a file whose name promises contents
-    it does not have -- everything downstream trusts that name."""
-    import openbackup.repo.chunkstore as mod
-
-    def boom(*a, **k):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(mod.os, "replace", boom)
-    with pytest.raises(OSError):
-        store.put(os.urandom(4096))
-    assert sum(1 for _ in store.iter_hashes()) == 0
-
-
-# -- encryption -------------------------------------------------------------
-
-def test_encrypted_chunks_roundtrip(tmp_path):
-    key = os.urandom(32)
-    cs = ChunkStore(tmp_path / "enc", key=key)
-    cs.init()
-    data = os.urandom(16 * 1024)
-    res = cs.put(data)
-    assert cs.get(res.hash) == data
-    assert data not in cs.path_for(res.hash).read_bytes()
-
-
-def test_encrypted_repo_is_unreadable_without_the_key(tmp_path):
-    key = os.urandom(32)
-    enc = ChunkStore(tmp_path / "enc", key=key)
-    enc.init()
-    res = enc.put(os.urandom(4096))
-
-    plain = ChunkStore(tmp_path / "enc")
-    with pytest.raises(ChunkCorruption, match="no key"):
-        plain.get(res.hash)
-
-    wrong = ChunkStore(tmp_path / "enc", key=os.urandom(32))
-    with pytest.raises(ChunkCorruption, match="authentication"):
-        wrong.get(res.hash)
 
 
 # -- block maps -------------------------------------------------------------
@@ -226,14 +109,15 @@ def test_distinct_hashes_for_refcounting():
     assert len(bm.distinct_hashes()) == 1
 
 
-def test_disk_and_map_survive_a_full_store_roundtrip(store, tmp_path):
+def test_disk_and_map_survive_a_full_store_roundtrip(packed_store, tmp_path):
     """The end-to-end property that matters: chunk a disk image, throw the
     original away, and rebuild it byte for byte from the map."""
     disk = os.urandom(5 * MIB + 12345)
     bm = BlockMap(len(disk), chunk_size=MIB)
     for i in range(len(bm)):
         off, length = bm.block_range(i)
-        bm[i] = store.put(disk[off:off + length]).hash
+        bm[i] = packed_store.put(disk[off:off + length]).hash
+    packed_store.flush()
     bm.validate()
     bm.save(tmp_path / "disk0.bm")
 
@@ -241,5 +125,5 @@ def test_disk_and_map_survive_a_full_store_roundtrip(store, tmp_path):
     rebuilt = bytearray(len(disk))
     for i in range(len(reloaded)):
         off, length = reloaded.block_range(i)
-        rebuilt[off:off + length] = store.get(reloaded[i])
+        rebuilt[off:off + length] = packed_store.get(reloaded[i])
     assert bytes(rebuilt) == disk

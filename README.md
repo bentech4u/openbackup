@@ -31,17 +31,42 @@ That gives synthetic fulls for free, makes every point independently
 restorable, deduplicates across VMs, and reduces retention to a refcount
 decrement instead of an increment merge.
 
+Chunks are grouped into ~128 MB **pack files**. One file per 1 MiB chunk is
+fine on a local disk but the wrong shape for NFS, where each chunk would cost
+a create, a write, a commit and a rename, and a 100 GB VM would leave ~100,000
+files to walk on every verify. Measured over a loopback NFS export, a 512 MiB
+disk lands in 4 pack files instead of 512.
+
 Blocks are a fixed 1 MiB, not content-defined. VM disk writes land at stable
 offsets, so a fixed grid already aligns between backups; content-defined
 chunking solves byte-insertion drift, which does not happen inside a block
 device, and would cost the direct index -> offset mapping that keeps restore a
 simple seek.
 
+### Destinations
+
+A repository lives on a local disk or an NFS export, chosen per job:
+
+    open_repository(Destination(kind="local", path="/backup/openbackup"))
+
+    open_repository(Destination(kind="nfs", server="10.0.0.5",
+                                export="/vol/backup", path="site-a"))
+
+NFS exports are mounted and unmounted around the job. A mount already in place
+is adopted and left alone rather than torn down. Mounts default to `hard`: a
+soft mount returns EIO on timeout, which during a restore means silently
+incomplete data.
+
+The share is authoritative. The local SQLite index is a rebuildable cache --
+SQLite over NFS depends on a working lock daemon and corrupts badly without
+one -- so each pack carries a trailer listing its contents, and a fresh server
+recovers a repository by reading only pack tails.
+
 ## Layout
 
     openbackup/nbd/        NBD client (pure Python, pipelined)
-    openbackup/repo/       chunk store, block maps
-    openbackup/transport/  VDDK/nbdkit and datastore transports  [next]
+    openbackup/repo/       codec, pack files, block maps, index, destinations
+    openbackup/transport/  datastore HTTPS and VDDK/nbdkit transports
     openbackup/vsphere/    connection, inventory, snapshots, CBT [next]
     openbackup/jobs/       backup and restore orchestration      [next]
 

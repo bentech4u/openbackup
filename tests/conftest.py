@@ -73,3 +73,19 @@ def nbdkit_memory():
     yield _make
     for srv in servers:
         srv.stop()
+
+
+@pytest.fixture
+def packed_store(tmp_path):
+    """A repository-backed chunk store on a local filesystem."""
+    from openbackup.repo.backend import FilesystemBackend
+    from openbackup.repo.index import ChunkIndex
+    from openbackup.repo.store import PackedChunkStore
+
+    backend = FilesystemBackend(tmp_path / "repo")
+    backend.init()
+    index = ChunkIndex(tmp_path / "index.sqlite")
+    store = PackedChunkStore(backend, index, pack_size=4 * 1024 * 1024)
+    yield store
+    store.flush()
+    index.close()

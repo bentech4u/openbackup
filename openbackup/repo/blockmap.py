@@ -19,7 +19,7 @@ from pathlib import Path
 
 import zstandard
 
-from .chunkstore import HASH_BYTES
+from .codec import HASH_BYTES
 
 #: 1 MiB. Large enough that per-chunk overhead stays negligible, small enough
 #: that a small guest write does not force us to re-store a huge block. Also a
