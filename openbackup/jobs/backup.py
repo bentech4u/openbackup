@@ -52,6 +52,7 @@ class BackupResult:
     chunks_deduped: int = 0
     bytes_stored: int = 0
     quiesced: bool = False
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def bytes_read(self) -> int:
@@ -153,7 +154,10 @@ class BackupJob:
         blockmaps: dict[int, BlockMap] = {}
         disk_points: list[DiskPoint] = []
 
-        with SnapshotSession(self.conn, vm, quiesce=self.quiesce) as snap:
+        session = SnapshotSession(self.conn, vm, quiesce=self.quiesce)
+        snap = session.create()
+        snapshot_error: Exception | None = None
+        try:
             result.quiesced = snap.quiesced
             for disk in info.disks:
                 transport, via = transport_for(disk.datastore)
@@ -168,8 +172,23 @@ class BackupJob:
                 blockmaps[disk.key] = bm
                 disk_points.append(dp)
 
-        # Chunks must be durable before anything references them.
-        store.flush()
+            # Make the chunks durable while we still hold the snapshot. A slow
+            # or failed snapshot removal then costs an operator some cleanup
+            # rather than discarding the whole read.
+            store.flush()
+        finally:
+            try:
+                session.remove()
+            except Exception as exc:
+                # The data we read is valid regardless: it came from a frozen
+                # snapshot. A leftover snapshot is an operational problem, not
+                # a reason to throw away a good backup -- but it grows until
+                # someone deals with it, so say so loudly.
+                snapshot_error = exc
+                log.error(
+                    "%s: BACKUP DATA IS GOOD but the snapshot could not be "
+                    "removed (%s). Remove it manually before the delta grows.",
+                    info.name, exc)
 
         kind = (INCREMENTAL
                 if all(d.kind == INCREMENTAL for d in result.disks) and previous
@@ -190,6 +209,9 @@ class BackupJob:
         result.chunks_written = store.stats.chunks_written
         result.chunks_deduped = store.stats.chunks_deduped
         result.bytes_stored = store.stats.bytes_stored
+        if snapshot_error is not None:
+            result.warnings.append(
+                f"snapshot left on {info.name}: {snapshot_error}")
         return result
 
     # -- one disk -----------------------------------------------------------

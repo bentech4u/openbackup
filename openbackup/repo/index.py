@@ -15,6 +15,7 @@ costs a reindex, not a backup.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -53,21 +54,47 @@ class ChunkLocation:
 
 
 class ChunkIndex:
+    """SQLite index of chunk locations.
+
+    Connections are per-thread. sqlite3 refuses to use a connection from a
+    thread other than the one that created it, and the web interface serves
+    synchronous endpoints from a worker pool, so a single shared connection
+    fails as soon as anything but the CLI uses the index. WAL mode lets those
+    connections read concurrently with a backup writing.
+
+    One consequence worth knowing: the temporary table used for garbage
+    collection belongs to the connection that created it, so a collection must
+    run entirely on one thread. It does -- :func:`~openbackup.repo.gc.
+    collect_garbage` is synchronous -- but splitting it across threads would
+    silently lose the live set.
+    """
+
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path), isolation_level=None)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        # Durability here is not critical: the index is a cache and a lost
-        # write costs a reindex, not data. NORMAL avoids an fsync per commit
-        # while a backup inserts hundreds of thousands of rows.
-        self._db.execute("PRAGMA synchronous=NORMAL")
-        self._db.execute("PRAGMA foreign_keys=ON")
+        self._local = threading.local()
         self._db.executescript(_SCHEMA)
         self._db.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES('schema', ?)",
             (SCHEMA_VERSION,),
         )
+
+    @property
+    def _db(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.path), isolation_level=None)
+            conn.execute("PRAGMA journal_mode=WAL")
+            # Durability here is not critical: the index is a cache and a lost
+            # write costs a reindex, not data. NORMAL avoids an fsync per
+            # commit while a backup inserts hundreds of thousands of rows.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            # Concurrent readers are normal here: the web interface reads while
+            # a backup writes. Wait rather than failing instantly on a lock.
+            conn.execute("PRAGMA busy_timeout=10000")
+            self._local.conn = conn
+        return conn
 
     # -- lookup -------------------------------------------------------------
 
@@ -202,7 +229,16 @@ class ChunkIndex:
             self._db.execute("DELETE FROM packs")
 
     def close(self) -> None:
-        self._db.close()
+        """Close this thread's connection.
+
+        Connections held by other threads are left to be closed when those
+        threads or the process end; sqlite3 will not let us close them from
+        here anyway.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def __enter__(self) -> "ChunkIndex":
         return self

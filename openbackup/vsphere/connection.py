@@ -29,6 +29,11 @@ class VSphereConfig:
     user: str
     password: str
     port: int = 443
+    #: Seconds to wait on a single vCenter HTTP call. Without this a hung
+    #: vpxd blocks a job indefinitely -- observed in practice: the API port
+    #: kept accepting connections while never answering, and a backup sat in
+    #: snapshot removal until killed.
+    http_timeout: float = 120.0
     #: Verifying TLS is the default. Lab vCenters use self-signed certificates,
     #: so turning it off is normal there, but it has to be a deliberate choice:
     #: an unverified session can be intercepted, credentials included.
@@ -52,6 +57,7 @@ class VSphereConfig:
             user=values["VCENTER_USER"],
             password=values["VCENTER_PASS"],
             port=int(values.get("VCENTER_PORT", 443)),
+            http_timeout=float(values.get("VCENTER_TIMEOUT", 120)),
             verify_ssl=values.get("VCENTER_INSECURE", "0") not in ("1", "true", "yes"),
         )
 
@@ -95,6 +101,7 @@ class VSphereConnection:
                 host=self.config.host, port=self.config.port,
                 user=self.config.user, pwd=self.config.password,
                 sslContext=ctx,
+                httpConnectionTimeout=self.config.http_timeout,
             )
         except vim.fault.InvalidLogin as exc:
             raise VSphereError(

@@ -480,5 +480,26 @@ def repo_gc(ctx: Context, dry_run, repack_below):
         repository.close()
 
 
+@main.command()
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Address to listen on. 0.0.0.0 exposes it to the network.")
+@click.option("--port", default=8080, show_default=True)
+@click.pass_obj
+def web(ctx: Context, host, port):
+    """Serve the read-only status interface."""
+    import uvicorn
+
+    from .web.app import create_app
+
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        console.print(
+            "[yellow]note:[/] this interface has no authentication. Bind it to "
+            "localhost and reach it over SSH, or put it behind a reverse proxy "
+            "that authenticates.")
+    console.print(f"serving on [bold]http://{host}:{port}/[/]  "
+                  f"(API docs at /api/docs)")
+    uvicorn.run(create_app(ctx.config), host=host, port=port, log_level="warning")
+
+
 if __name__ == "__main__":
     main()
