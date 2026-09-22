@@ -23,12 +23,24 @@ class VSphereError(Exception):
     pass
 
 
+class ReadOnlyError(VSphereError):
+    """Refused because this connection is configured not to change vSphere."""
+
+
 @dataclass
 class VSphereConfig:
     host: str
     user: str
     password: str
     port: int = 443
+    #: Refuse every operation that changes vSphere state -- snapshots,
+    #: reconfiguration, CBT enablement. Reads are unaffected. Backups of
+    #: running VMs need a snapshot and so cannot run in this mode; backups of
+    #: powered-off VMs can, because their disks are already consistent.
+    #:
+    #: This exists so "do not touch vCenter" is enforced by the code rather
+    #: than by remembering.
+    read_only: bool = False
     #: Seconds to wait on a single vCenter HTTP call. Without this a hung
     #: vpxd blocks a job indefinitely -- observed in practice: the API port
     #: kept accepting connections while never answering, and a backup sat in
@@ -58,6 +70,7 @@ class VSphereConfig:
             password=values["VCENTER_PASS"],
             port=int(values.get("VCENTER_PORT", 443)),
             http_timeout=float(values.get("VCENTER_TIMEOUT", 120)),
+            read_only=values.get("VCENTER_READ_ONLY", "0") in ("1", "true", "yes"),
             verify_ssl=values.get("VCENTER_INSECURE", "0") not in ("1", "true", "yes"),
         )
 
@@ -141,6 +154,14 @@ class VSphereConnection:
     @property
     def is_vcenter(self) -> bool:
         return self.content.about.apiType == "VirtualCenter"
+
+    def ensure_writable(self, operation: str) -> None:
+        """Raise unless this connection is allowed to change vSphere state."""
+        if self.config.read_only:
+            raise ReadOnlyError(
+                f"refusing to {operation}: this connection is read-only "
+                "(unset VCENTER_READ_ONLY to allow changes)"
+            )
 
     @property
     def cookie(self) -> str:

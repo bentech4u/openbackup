@@ -131,7 +131,7 @@ class BackupJob:
             )
 
         if self.enable_cbt and not info.cbt_enabled:
-            cbt.ensure_enabled(vm)
+            cbt.ensure_enabled(vm, conn=self.conn)
             info = describe_vm(self.conn, vm)
 
         points = PointStore(self.repo.backend)

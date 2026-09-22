@@ -52,7 +52,8 @@ def is_enabled(vm: vim.VirtualMachine) -> bool:
     return bool(vm.config and vm.config.changeTrackingEnabled)
 
 
-def enable(vm: vim.VirtualMachine, *, timeout: float = 300.0) -> bool:
+def enable(vm: vim.VirtualMachine, *, conn=None,
+           timeout: float = 300.0) -> bool:
     """Turn CBT on. Returns True if it changed anything.
 
     The setting takes effect only after the VM is "stunned" -- see
@@ -62,6 +63,8 @@ def enable(vm: vim.VirtualMachine, *, timeout: float = 300.0) -> bool:
     """
     if is_enabled(vm):
         return False
+    if conn is not None:
+        conn.ensure_writable(f"enable CBT on {vm.name}")
     log.info("%s: enabling changed block tracking", vm.name)
     spec = vim.vm.ConfigSpec(changeTrackingEnabled=True)
     wait_for_task(vm.ReconfigVM_Task(spec), f"enabling CBT on {vm.name}",
@@ -69,12 +72,15 @@ def enable(vm: vim.VirtualMachine, *, timeout: float = 300.0) -> bool:
     return True
 
 
-def activate(vm: vim.VirtualMachine, *, timeout: float = 600.0) -> None:
+def activate(vm: vim.VirtualMachine, *, conn=None,
+             timeout: float = 600.0) -> None:
     """Stun the VM so newly enabled CBT starts tracking.
 
     A snapshot create/delete cycle is enough, and unlike a power cycle it needs
     no downtime.
     """
+    if conn is not None:
+        conn.ensure_writable(f"stun {vm.name} to activate CBT")
     log.info("%s: stunning to activate CBT", vm.name)
     wait_for_task(
         vm.CreateSnapshot_Task(name="openbackup-cbt-activate",
@@ -88,11 +94,12 @@ def activate(vm: vim.VirtualMachine, *, timeout: float = 600.0) -> None:
                   timeout=timeout)
 
 
-def ensure_enabled(vm: vim.VirtualMachine, *, activate_now: bool = True) -> bool:
+def ensure_enabled(vm: vim.VirtualMachine, *, conn=None,
+                   activate_now: bool = True) -> bool:
     """Enable CBT and make it live. Returns True if we changed the VM."""
-    changed = enable(vm)
+    changed = enable(vm, conn=conn)
     if changed and activate_now:
-        activate(vm)
+        activate(vm, conn=conn)
     return changed
 
 

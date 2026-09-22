@@ -61,6 +61,8 @@ class Config:
         if env_file:
             vcenter = VSphereConfig.from_env_file(
                 Path(env_file).expanduser())
+            if vc.get("read_only"):
+                vcenter.read_only = True
         else:
             missing = [k for k in ("host", "user", "password") if not vc.get(k)]
             if missing:
@@ -70,6 +72,7 @@ class Config:
                 host=vc["host"], user=vc["user"], password=vc["password"],
                 port=int(vc.get("port", 443)),
                 verify_ssl=not vc.get("insecure", False),
+                read_only=bool(vc.get("read_only", False)),
             )
 
         repo = data.get("repository")

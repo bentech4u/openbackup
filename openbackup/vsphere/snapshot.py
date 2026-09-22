@@ -88,6 +88,7 @@ class SnapshotSession:
     # -- lifecycle ----------------------------------------------------------
 
     def create(self) -> SnapshotHandle:
+        self.conn.ensure_writable(f"snapshot {self.vm.name}")
         self.check_preconditions()
 
         quiesce = self.quiesce
