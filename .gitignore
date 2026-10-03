@@ -25,3 +25,4 @@ index/
 frontend/node_modules/
 frontend/dist/
 openbackup/web/
+frontend/*.tsbuildinfo
