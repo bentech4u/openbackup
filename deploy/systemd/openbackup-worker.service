@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenBackup job worker and scheduler
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/openbackup/openbackup.env
+ExecStart=/opt/openbackup/.venv/bin/openbackup worker
+Restart=on-failure
+RestartSec=10
+# Let running backups finish their current step and remove their snapshot.
+KillMode=mixed
+TimeoutStopSec=600
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenBackup web interface and API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/openbackup/openbackup.env
+ExecStart=/opt/openbackup/.venv/bin/openbackup serve --host 0.0.0.0 --port 8443 \
+    --certfile /etc/openbackup/tls.crt --keyfile /etc/openbackup/tls.key
+Restart=on-failure
+RestartSec=5
+# Runs as root: creating and testing NFS repositories mounts shares. No
+# private mount namespace (PrivateTmp, ProtectSystem...) so that mounts are
+# shared with the worker.
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
