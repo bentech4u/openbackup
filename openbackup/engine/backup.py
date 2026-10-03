@@ -42,6 +42,14 @@ class BackupResult:
     warnings: list[str] = field(default_factory=list)
 
 
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
 def blocks_for_extents(extents: list[Extent], block_size: int, capacity: int) -> list[int]:
     """Indices of every block touched by any extent, in order."""
     blocks: set[int] = set()
@@ -144,8 +152,7 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
             item = f"{name} / {d.label}"
             ctx.item(item, vm=name, disk=d.label, mode=mode, capacity=d.capacity,
                      to_read=to_read, read=0, state="running")
-            ctx.log(f"{name}: {d.label} {mode}, reading {to_read / 2**20:.0f} MiB of "
-                    f"{d.capacity / 2**30:.1f} GiB")
+            ctx.log(f"{name}: {d.label} {mode}, reading {human(to_read)} of {human(d.capacity)}")
             read = _copy_blocks(source, vm_moref, sref.moref, d, m, blocks, writer, ctx,
                                 item, opts.read_depth)
             ctx.item(item, read=read, state="done")
@@ -187,7 +194,7 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
                  "the next run; remove it manually if the VM is no longer backed up.")
 
     ctx.log(f"{name}: restore point {point_id} created ({manifest['kind']}, read "
-            f"{totals['read'] / 2**20:.0f} MiB, stored {writer.new_bytes / 2**20:.0f} MiB new)")
+            f"{human(totals['read'])}, stored {human(writer.new_bytes)} new)")
     manifest["id"] = point_id
     return BackupResult(point_id, manifest, warnings)
 

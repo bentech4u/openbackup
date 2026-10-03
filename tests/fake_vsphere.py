@@ -200,3 +200,17 @@ class FakeVSphere:
                           power_state=v.power, disks=len(v.disks), cbt_enabled=v.cbt,
                           provisioned_bytes=sum(d.capacity for d in v.disks))
                 for v in self.vms.values()]
+
+    def placement_options(self):
+        from openbackup.vsphere.types import PlacementOptions
+
+        return PlacementOptions(
+            datacenters=[{"moref": "datacenter-1", "name": "DC1", "vm_folder": "group-v1"}],
+            hosts=[{"moref": "host-1", "name": "esx01.lab", "connected": True,
+                    "maintenance": False}],
+            datastores=[{"moref": "datastore-1", "name": "ds1", "capacity": 2 << 40,
+                         "free": 1 << 40, "type": "NFS", "accessible": True}],
+            networks=[{"moref": "network-1", "name": "VM Network", "kind": "network"}],
+            folders=[{"moref": "group-v1", "name": "vm"}],
+            resource_pools=[{"moref": "resgroup-1", "name": "Resources", "owner": "Cluster1"}],
+        )
