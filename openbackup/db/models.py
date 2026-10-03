@@ -22,6 +22,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    TypeDecorator,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -30,8 +31,27 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+class UTCDateTime(TypeDecorator):
+    """Stores UTC and always hands back timezone-aware values. SQLite keeps
+    no zone, so without this, times would come back naive and be
+    misread as local time by API clients."""
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is not None:
+            value = value.astimezone(UTC)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value
+
+
 class Base(DeclarativeBase):
-    type_annotation_map = {datetime: DateTime(timezone=True)}
+    type_annotation_map = {datetime: UTCDateTime()}
 
 
 class Role(enum.StrEnum):

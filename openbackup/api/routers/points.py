@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from ... import services
+from ...db.models import Repository as RepoRow
+from ...db.models import RestorePoint, Role, Task, TaskKind, VCenter
+from ...repo.repository import RepositoryError
+from ..deps import Principal, admin, audit, get_db, operator, viewer
+from ..schemas import RestorePointOut, TaskOut
+
+router = APIRouter(prefix="/api/points", tags=["restore points"])
+
+
+@router.get("", response_model=list[RestorePointOut])
+def list_points(
+    vm_uuid: str | None = None,
+    repository_id: int | None = None,
+    job_id: int | None = None,
+    q: str | None = Query(None, max_length=255),
+    limit: int = Query(200, ge=1, le=2000),
+    db: Session = Depends(get_db),
+    _: Principal = Depends(viewer),
+):
+    stmt = select(RestorePoint).order_by(RestorePoint.created_at.desc()).limit(limit)
+    if vm_uuid:
+        stmt = stmt.where(RestorePoint.vm_uuid == vm_uuid)
+    if repository_id:
+        stmt = stmt.where(RestorePoint.repository_id == repository_id)
+    if job_id:
+        stmt = stmt.where(RestorePoint.job_id == job_id)
+    if q:
+        stmt = stmt.where(RestorePoint.vm_name.ilike(f"%{q}%"))
+    return list(db.scalars(stmt))
+
+
+@router.get("/vms")
+def protected_vms(db: Session = Depends(get_db), _: Principal = Depends(viewer)) -> list[dict]:
+    """One row per backed-up VM with its point count and latest point."""
+    rows = db.execute(
+        select(RestorePoint.vm_uuid, func.max(RestorePoint.vm_name), func.count(),
+               func.max(RestorePoint.created_at), func.sum(RestorePoint.new_bytes))
+        .group_by(RestorePoint.vm_uuid)
+        .order_by(func.max(RestorePoint.vm_name))).all()
+    return [{"vm_uuid": u, "vm_name": n, "points": c, "latest": latest, "stored_bytes": s}
+            for u, n, c, latest, s in rows]
+
+
+def _point(db: Session, point_id: str) -> RestorePoint:
+    p = db.get(RestorePoint, point_id)
+    if p is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Restore point not found")
+    return p
+
+
+def _manifest(row: RepoRow, point_id: str) -> dict:
+    with services.open_repository(row) as repo:
+        return repo.load_manifest(point_id)
+
+
+@router.get("/{point_id}")
+async def get_point(point_id: str, db: Session = Depends(get_db),
+                    _: Principal = Depends(viewer)) -> dict:
+    p = _point(db, point_id)
+    row = db.get(RepoRow, p.repository_id)
+    db.expunge(row)
+    try:
+        m = await run_in_threadpool(_manifest, row, point_id)
+    except (services.ServiceError, RepositoryError, OSError) as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Repository unavailable: {e}") \
+            from None
+    out = RestorePointOut.model_validate(p).model_dump(mode="json")
+    out.update(config=m.get("config", {}), vcenter=m.get("vcenter", ""),
+               warnings=m.get("warnings", []), duration_s=m.get("duration_s"),
+               disk_details=m.get("disks", []))
+    return out
+
+
+@router.post("/{point_id}/verify", response_model=TaskOut, status_code=202)
+def verify(point_id: str, request: Request, db: Session = Depends(get_db),
+           pr: Principal = Depends(operator)):
+    p = _point(db, point_id)
+    t = Task(kind=TaskKind.verify, title=f"Verify {p.vm_name} {point_id}",
+             repository_id=p.repository_id, requested_by=pr.user.username,
+             params={"point_id": point_id})
+    db.add(t)
+    db.flush()
+    audit(db, request, "point.verify", principal=pr, target=point_id)
+    return t
+
+
+@router.delete("/{point_id}", response_model=TaskOut, status_code=202)
+def delete_point(point_id: str, request: Request, db: Session = Depends(get_db),
+                 pr: Principal = Depends(admin)):
+    p = _point(db, point_id)
+    t = Task(kind=TaskKind.gc, title=f"Delete {p.vm_name} {point_id}",
+             repository_id=p.repository_id, requested_by=pr.user.username,
+             params={"delete_points": [point_id]})
+    db.add(t)
+    db.flush()
+    audit(db, request, "point.delete", principal=pr, target=f"{p.vm_name} {point_id}")
+    return t
+
+
+class NewVmIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    folder: str
+    resource_pool: str
+    datastore: str = Field(min_length=1, max_length=255)
+    host: str | None = None
+    network_map: dict[str, str] = {}
+    power_on: bool = False
+
+
+class RestoreIn(BaseModel):
+    mode: Literal["new_vm", "in_place", "export"]
+    vcenter_id: int | None = None
+    target: NewVmIn | None = None
+    format: Literal["raw", "vmdk", "qcow2"] = "raw"
+    power_on: bool = False
+
+
+@router.post("/{point_id}/restore", response_model=TaskOut, status_code=202)
+def restore(point_id: str, body: RestoreIn, request: Request, db: Session = Depends(get_db),
+            pr: Principal = Depends(operator)):
+    p = _point(db, point_id)
+    params: dict = {"point_id": point_id, "mode": body.mode}
+    if body.mode == "in_place" and pr.role.rank < Role.admin.rank:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "Overwriting a production VM requires the admin role")
+    if body.mode in ("new_vm", "in_place"):
+        if body.vcenter_id is None or db.get(VCenter, body.vcenter_id) is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose the target vCenter")
+        params["vcenter_id"] = body.vcenter_id
+    if body.mode == "new_vm":
+        if body.target is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target placement is required")
+        params["target"] = body.target.model_dump()
+        title = f"Restore {p.vm_name} as {body.target.name}"
+    elif body.mode == "in_place":
+        params["power_on"] = body.power_on
+        title = f"Restore {p.vm_name} over the original VM"
+    else:
+        row = db.get(RepoRow, p.repository_id)
+        db.expunge(row)
+        try:
+            loc = services.repo_location(row)
+        except services.ServiceError as e:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e)) from None
+        # Exports always land inside the repository, never at a caller-chosen path.
+        params["path"] = str(loc / "exports" / point_id)
+        params["format"] = body.format
+        title = f"Export disks of {p.vm_name} ({body.format})"
+    t = Task(kind=TaskKind.restore, title=title, repository_id=p.repository_id,
+             requested_by=pr.user.username, params=params)
+    db.add(t)
+    db.flush()
+    audit(db, request, f"point.restore.{body.mode}", principal=pr,
+          target=f"{p.vm_name} {point_id}", detail={k: v for k, v in params.items()
+                                                     if k != "point_id"})
+    return t

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -23,13 +23,6 @@ IP_WINDOW = timedelta(minutes=15)
 class LoginError(Exception):
     """Raised for any failed login. The message is safe to show to the user
     and deliberately does not distinguish unknown users from bad passwords."""
-
-
-def _aware(dt: datetime | None) -> datetime | None:
-    # SQLite drops tzinfo; everything we store is UTC.
-    if dt is not None and dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt
 
 
 def token_id(token: str) -> str:
@@ -57,7 +50,7 @@ def authenticate(
     user = db.scalar(select(User).where(func.lower(User.username) == username.lower()))
     ok = verify_password(user.password_hash if user else None, password)
 
-    if user is not None and _aware(user.locked_until) and _aware(user.locked_until) > now:
+    if user is not None and user.locked_until and user.locked_until > now:
         # Checked after hashing so a locked account costs the same time.
         db.add(LoginFailure(ip=ip, at=now))
         raise LoginError("Account is temporarily locked. Try again later.")
@@ -100,13 +93,13 @@ def resolve_session(db: Session, settings: Settings, token: str | None) -> AuthS
     if s is None:
         return None
     now = utcnow()
-    idle = now - _aware(s.last_seen_at) > timedelta(minutes=settings.session_idle_minutes)
-    old = now - _aware(s.created_at) > timedelta(hours=settings.session_absolute_hours)
+    idle = now - s.last_seen_at > timedelta(minutes=settings.session_idle_minutes)
+    old = now - s.created_at > timedelta(hours=settings.session_absolute_hours)
     if idle or old or not s.user.is_active:
         db.delete(s)
         return None
     # Avoid a write per request; a minute of slack on the idle timer is fine.
-    if now - _aware(s.last_seen_at) > timedelta(minutes=1):
+    if now - s.last_seen_at > timedelta(minutes=1):
         s.last_seen_at = now
     return s
 

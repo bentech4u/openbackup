@@ -127,23 +127,28 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
         disks = [d for d in disks if not d.independent]
         if not disks:
             raise BackupError(f"{name} has no disks that can be backed up")
-        ctx.progress(0.0, total=sum(d.capacity for d in disks))
-
+        # Plan every disk first (CBT queries are quick) so progress has a
+        # meaningful total: the bytes that will actually be read.
+        plans = []
         for d in disks:
             check_cancel(ctx)
-            base, extents, mode = _plan_disk(source, repo, vm, snap, d, prev, active_full, ctx,
-                                             name, warn)
-            any_full = any_full or mode != "incremental"
-            m = base
+            m, extents, mode = _plan_disk(source, repo, vm, snap, d, prev, active_full, ctx,
+                                          name, warn)
             blocks = blocks_for_extents(extents, m.block_size, d.capacity)
-            to_read = sum(m.block_length(i) for i in blocks)
-            ctx.item(f"{name} / {d.label}", vm=name, disk=d.label, mode=mode,
-                     capacity=d.capacity, to_read=to_read, read=0, state="running")
+            plans.append((d, m, mode, blocks, sum(m.block_length(i) for i in blocks)))
+        ctx.progress(0.0, total=sum(p[4] for p in plans))
+
+        for d, m, mode, blocks, to_read in plans:
+            check_cancel(ctx)
+            any_full = any_full or mode != "incremental"
+            item = f"{name} / {d.label}"
+            ctx.item(item, vm=name, disk=d.label, mode=mode, capacity=d.capacity,
+                     to_read=to_read, read=0, state="running")
             ctx.log(f"{name}: {d.label} {mode}, reading {to_read / 2**20:.0f} MiB of "
                     f"{d.capacity / 2**30:.1f} GiB")
             read = _copy_blocks(source, vm_moref, sref.moref, d, m, blocks, writer, ctx,
-                                f"{name} / {d.label}", opts.read_depth)
-            ctx.item(f"{name} / {d.label}", read=read, state="done")
+                                item, opts.read_depth)
+            ctx.item(item, read=read, state="done")
             maps[str(d.key)] = m
             totals["logical"] += d.capacity
             totals["read"] += read

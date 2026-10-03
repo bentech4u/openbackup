@@ -180,3 +180,23 @@ class FakeVSphere:
         mapping = {orig["key"]: new for orig, new in zip(config["disks"], vm.disks,
                                                           strict=True)}
         return vm.moref, mapping
+
+    # ------------------------------------------------ connection / inventory
+
+    def connect(self):
+        return self
+
+    def close(self) -> None:
+        pass
+
+    def about(self) -> dict:
+        return {"name": "Fake vCenter", "version": "8.0.3", "build": "1",
+                "api_type": "VirtualCenter", "instance_uuid": "fake"}
+
+    def list_vms(self):
+        from openbackup.vsphere.types import VmSummary
+
+        return [VmSummary(moref=v.moref, name=v.name, instance_uuid=v.instance_uuid,
+                          power_state=v.power, disks=len(v.disks), cbt_enabled=v.cbt,
+                          provisioned_bytes=sum(d.capacity for d in v.disks))
+                for v in self.vms.values()]

@@ -1,0 +1,243 @@
+"""Task executors: one function per task kind. Each returns (state, summary)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+from sqlalchemy import delete, select
+
+from .. import services
+from ..db import session_scope
+from ..db.models import Job, RestorePoint, Task, TaskKind, TaskState, VCenter
+from ..db.models import Repository as RepoRow
+from ..engine.backup import BackupOptions, backup_vm
+from ..engine.context import Cancelled
+from ..engine.restore import NewVmTarget, export_disks, restore_in_place, restore_new_vm
+from ..repo.maintenance import collect_garbage, select_expired, verify_point
+from ..repo.repository import Repository
+from .context import DbTaskContext, ScopedContext
+
+# Tests replace this to run against a fake vSphere.
+source_factory = services.vsphere_source
+
+
+def _load(task_id: int) -> tuple[Task, Job | None, RepoRow | None, VCenter | None]:
+    with session_scope() as db:
+        t = db.get(Task, task_id)
+        job = db.get(Job, t.job_id) if t.job_id else None
+        repo = db.get(RepoRow, t.repository_id) if t.repository_id else None
+        vc_id = job.vcenter_id if job else t.params.get("vcenter_id")
+        vc = db.get(VCenter, vc_id) if vc_id else None
+        db.expunge_all()
+    return t, job, repo, vc
+
+
+def record_point(repository_id: int, manifest: dict) -> None:
+    with session_scope() as db:
+        db.merge(RestorePoint(
+            id=manifest["id"], repository_id=repository_id, job_id=manifest.get("job_id"),
+            vm_uuid=manifest["vm"]["uuid"], vm_name=manifest["vm"]["name"],
+            vm_moref=manifest["vm"].get("moref", ""),
+            created_at=datetime.fromisoformat(manifest["created_at"]),
+            kind=manifest["kind"], logical_bytes=manifest.get("logical_bytes", 0),
+            read_bytes=manifest.get("read_bytes", 0), new_bytes=manifest.get("new_bytes", 0),
+            disks=[{"key": d["key"], "label": d["label"], "capacity": d["capacity"]}
+                   for d in manifest.get("disks", [])],
+        ))
+
+
+def sync_points(repository_id: int, repo: Repository) -> int:
+    """Make the database's list of points match the repository's."""
+    manifests = {m["id"]: m for m in repo.list_points()}
+    with session_scope() as db:
+        known = set(db.scalars(select(RestorePoint.id)
+                               .where(RestorePoint.repository_id == repository_id)))
+        stale = known - manifests.keys()
+        if stale:
+            db.execute(delete(RestorePoint).where(RestorePoint.id.in_(stale)))
+        jobs = set(db.scalars(select(Job.id)))
+    for pid in manifests.keys() - known:
+        m = manifests[pid]
+        if m.get("job_id") not in jobs:
+            m = {**m, "job_id": None}
+        record_point(repository_id, m)
+    return len(manifests)
+
+
+# ---------------------------------------------------------------------- backup
+
+
+def run_backup(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
+    task, job, repo_row, vc = _load(task_id)
+    if job is None or repo_row is None or vc is None:
+        return TaskState.failed, "Job, repository or vCenter no longer exists"
+    wanted = task.params.get("vms") or [v["moref"] for v in job.vms]
+    vms = [v for v in job.vms if v["moref"] in wanted]
+    if not vms:
+        return TaskState.failed, "Job has no VMs"
+    ctx.log(f"Backing up {len(vms)} VM(s) to repository {repo_row.name}")
+    for v in vms:
+        ctx.item(v["name"], kind="vm", state="pending")
+
+    ok, failed, warned = [], [], []
+    source = source_factory(vc)
+    source.connect()
+    try:
+        with services.open_repository(repo_row) as repo:
+            base_total = 0
+            for i, v in enumerate(vms):
+                if ctx.cancelled():
+                    raise Cancelled()
+                ctx.item(v["name"], state="running")
+                scoped = ScopedContext(ctx, i, len(vms), base_total)
+                opts = BackupOptions(
+                    quiesce=job.quiesce, active_full=bool(task.params.get("active_full")),
+                    active_full_days=job.active_full_days, job_id=job.id, job_name=job.name,
+                    task_id=task_id, vcenter=vc.host)
+                try:
+                    res = backup_vm(source, repo, v["moref"], opts, scoped)
+                except Cancelled:
+                    ctx.item(v["name"], state="cancelled")
+                    raise
+                except Exception as e:  # one VM failing must not stop the others
+                    ctx.log(f"{v['name']}: backup failed: {e}", "error")
+                    ctx.item(v["name"], state="failed", error=str(e))
+                    failed.append(v["name"])
+                    continue
+                finally:
+                    base_total += scoped.total
+                record_point(repo_row.id, res.manifest)
+                ctx.item(v["name"], state="warning" if res.warnings else "success",
+                         point_id=res.point_id, kind=res.manifest["kind"],
+                         read=res.manifest["read_bytes"], new=res.manifest["new_bytes"])
+                (warned if res.warnings else ok).append(v["name"])
+                _apply_retention(ctx, repo, repo_row.id, job, res.manifest["vm"]["uuid"])
+            _gc_if_needed(ctx, repo)
+    finally:
+        source.close()
+
+    with session_scope() as db:
+        j = db.get(Job, job.id)
+        if j:
+            j.last_run_at = datetime.now(UTC)
+    summary = f"{len(ok) + len(warned)} of {len(vms)} VMs backed up"
+    if failed:
+        summary += f"; failed: {', '.join(failed)}"
+    if failed and not (ok or warned):
+        return TaskState.failed, summary
+    if failed or warned:
+        return TaskState.warning, summary
+    return TaskState.success, summary
+
+
+_deleted_since_gc: dict[str, int] = {}
+
+
+def _apply_retention(ctx, repo: Repository, repository_id: int, job: Job, vm_uuid: str) -> None:
+    points = [m for m in repo.list_points()
+              if m.get("job_id") == job.id and m["vm"]["uuid"] == vm_uuid]
+    expired = select_expired(points, job.retention_points, job.retention_days)
+    for pid in expired:
+        repo.delete_point(pid)
+        ctx.log(f"Retention: removed restore point {pid}")
+    if expired:
+        with session_scope() as db:
+            db.execute(delete(RestorePoint).where(RestorePoint.id.in_(expired)))
+        _deleted_since_gc[repo.id] = _deleted_since_gc.get(repo.id, 0) + len(expired)
+
+
+def _gc_if_needed(ctx, repo: Repository) -> None:
+    if _deleted_since_gc.pop(repo.id, 0):
+        res = collect_garbage(repo, log=ctx.log)
+        ctx.log(f"Freed {res.bytes_freed / 2**30:.2f} GiB")
+
+
+# --------------------------------------------------------------------- restore
+
+
+def run_restore(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
+    task, _job, repo_row, vc = _load(task_id)
+    p = task.params
+    if repo_row is None:
+        return TaskState.failed, "Repository no longer exists"
+    with services.open_repository(repo_row) as repo:
+        if p["mode"] == "export":
+            dest = Path(p["path"])
+            files = export_disks(repo, p["point_id"], dest, p.get("format", "raw"), ctx)
+            return TaskState.success, f"Exported {len(files)} disk(s) to {dest}"
+        if vc is None:
+            return TaskState.failed, "vCenter no longer exists"
+        source = source_factory(vc)
+        source.connect()
+        try:
+            if p["mode"] == "new_vm":
+                t = p["target"]
+                moref = restore_new_vm(source, repo, p["point_id"], NewVmTarget(
+                    name=t["name"], folder=t["folder"], resource_pool=t["resource_pool"],
+                    datastore=t["datastore"], host=t.get("host"),
+                    network_map=t.get("network_map", {}), power_on=t.get("power_on", False)),
+                    ctx)
+                return TaskState.success, f"Restored as new VM {t['name']} ({moref})"
+            if p["mode"] == "in_place":
+                restore_in_place(source, repo, p["point_id"], ctx,
+                                 power_on=p.get("power_on", False))
+                return TaskState.success, "Restored over the original VM"
+        finally:
+            source.close()
+    return TaskState.failed, f"Unknown restore mode {p['mode']}"
+
+
+# --------------------------------------------------------------- maintenance
+
+
+def run_verify(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
+    task, _job, repo_row, _vc = _load(task_id)
+    if repo_row is None:
+        return TaskState.failed, "Repository no longer exists"
+    with services.open_repository(repo_row) as repo:
+        ids = [task.params["point_id"]] if task.params.get("point_id") else repo.point_ids()
+        bad = 0
+        checked = 0
+        for i, pid in enumerate(ids):
+            if ctx.cancelled():
+                raise Cancelled()
+            ctx.log(f"Verifying {pid}")
+            res = verify_point(repo, pid, log=ctx.log, cancelled=ctx.cancelled,
+                               progress=lambda f, i=i: ctx.progress((i + f) / len(ids)))
+            checked += res.bytes_checked
+            ctx.progress(read=res.bytes_checked)
+            ctx.item(pid, state="success" if res.ok else "failed",
+                     errors=res.errors[:20], chunks=res.chunks_checked)
+            if not res.ok:
+                bad += 1
+                ctx.log(f"{pid}: {len(res.errors)} problem(s)", "error")
+    if bad:
+        return TaskState.failed, f"{bad} of {len(ids)} restore point(s) failed verification"
+    return TaskState.success, f"{len(ids)} restore point(s) verified, " \
+                              f"{checked / 2**30:.2f} GiB read"
+
+
+def run_gc(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
+    task, _job, repo_row, _vc = _load(task_id)
+    if repo_row is None:
+        return TaskState.failed, "Repository no longer exists"
+    with services.open_repository(repo_row) as repo:
+        for pid in task.params.get("delete_points", []):
+            repo.delete_point(pid)
+            ctx.log(f"Deleted restore point {pid}")
+        n = sync_points(repo_row.id, repo)
+        ctx.log(f"Repository holds {n} restore point(s)")
+        if task.params.get("rescan_only"):
+            return TaskState.success, f"Found {n} restore point(s)"
+        res = collect_garbage(repo, log=ctx.log)
+    return TaskState.success, (f"{res.packs_deleted} packs deleted, {res.packs_repacked} "
+                               f"repacked, {res.bytes_freed / 2**30:.2f} GiB freed")
+
+
+EXECUTORS = {
+    TaskKind.backup: run_backup,
+    TaskKind.restore: run_restore,
+    TaskKind.verify: run_verify,
+    TaskKind.gc: run_gc,
+}
