@@ -20,3 +20,8 @@ index/
 
 /repo-test/
 /vddk/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+openbackup/web/
