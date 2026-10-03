@@ -34,7 +34,7 @@ class Base(DeclarativeBase):
     type_annotation_map = {datetime: DateTime(timezone=True)}
 
 
-class Role(str, enum.Enum):
+class Role(enum.StrEnum):
     viewer = "viewer"
     operator = "operator"
     admin = "admin"
@@ -116,7 +116,7 @@ class VCenter(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
-class RepoKind(str, enum.Enum):
+class RepoKind(enum.StrEnum):
     local = "local"
     nfs = "nfs"
 
@@ -164,14 +164,14 @@ class Job(Base):
     repository: Mapped[Repository] = relationship()
 
 
-class TaskKind(str, enum.Enum):
+class TaskKind(enum.StrEnum):
     backup = "backup"
     restore = "restore"
     verify = "verify"
     gc = "gc"
 
 
-class TaskState(str, enum.Enum):
+class TaskState(enum.StrEnum):
     queued = "queued"
     running = "running"
     success = "success"
