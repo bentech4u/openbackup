@@ -9,7 +9,16 @@ from sqlalchemy import delete, select
 
 from .. import services
 from ..db import session_scope
-from ..db.models import Job, RestorePoint, Task, TaskKind, TaskState, VCenter
+from ..db.models import (
+    Job,
+    JobKind,
+    KubeCluster,
+    RestorePoint,
+    Task,
+    TaskKind,
+    TaskState,
+    VCenter,
+)
 from ..db.models import Repository as RepoRow
 from ..engine.backup import BackupOptions, backup_vm
 from ..engine.context import Cancelled
@@ -34,7 +43,7 @@ def flr_session_factory(repo_row, point_id: str, repo):
     return FlrSession(repo_row, point_id, repo=repo).open()
 
 
-SECRET_PARAMS = ("guest_password_enc",)
+SECRET_PARAMS = ("guest_password_enc", "restore_token_enc")
 
 
 def scrub_secrets(task: Task) -> None:
@@ -61,7 +70,8 @@ def record_point(repository_id: int, manifest: dict) -> None:
             vm_uuid=manifest["vm"]["uuid"], vm_name=manifest["vm"]["name"],
             vm_moref=manifest["vm"].get("moref", ""),
             created_at=datetime.fromisoformat(manifest["created_at"]),
-            kind=manifest["kind"], logical_bytes=manifest.get("logical_bytes", 0),
+            kind=manifest["kind"], subject_kind=manifest.get("subject_kind", "vm"),
+            logical_bytes=manifest.get("logical_bytes", 0),
             read_bytes=manifest.get("read_bytes", 0), new_bytes=manifest.get("new_bytes", 0),
             disks=[{"key": d["key"], "label": d["label"], "capacity": d["capacity"]}
                    for d in manifest.get("disks", [])],
@@ -89,8 +99,16 @@ def sync_points(repository_id: int, repo: Repository) -> int:
 # ---------------------------------------------------------------------- backup
 
 
+def kube_client_factory(api_url: str, token: str, ca_pem: str):
+    from ..kube.client import KubeClient
+
+    return KubeClient(api_url, token, ca_pem)
+
+
 def run_backup(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
     task, job, repo_row, vc = _load(task_id)
+    if job is not None and job.kind == JobKind.openshift:
+        return _run_openshift_backup(task_id, task, job, repo_row, vc, ctx)
     if job is None or repo_row is None or vc is None:
         return TaskState.failed, "Job, repository or vCenter no longer exists"
     wanted = task.params.get("vms") or [v["moref"] for v in job.vms]
@@ -174,6 +192,69 @@ def _gc_if_needed(ctx, repo: Repository) -> None:
         ctx.log(f"Freed {res.bytes_freed / 2**30:.2f} GiB")
 
 
+def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskState, str]:
+    from ..auth.secrets import decrypt
+    from ..kube.engine import NamespaceBackupOptions, backup_namespace, subject_id
+
+    with session_scope() as db:
+        cluster = db.get(KubeCluster, job.cluster_id) if job.cluster_id else None
+        if cluster is not None:
+            db.expunge(cluster)
+    if cluster is None or repo_row is None:
+        return TaskState.failed, "Cluster or repository no longer exists"
+    wanted = task.params.get("namespaces") or job.selection.get("namespaces", [])
+    if not wanted:
+        return TaskState.failed, "Job has no namespaces"
+    ctx.log(f"Backing up {len(wanted)} namespace(s) of {cluster.name} to repository "
+            f"{repo_row.name}")
+    for ns in wanted:
+        ctx.item(ns, kind="namespace", state="pending")
+    ok, failed, warned = [], [], []
+    kube = kube_client_factory(cluster.api_url, decrypt(cluster.backup_token_enc),
+                               cluster.ca_pem)
+    try:
+        with services.open_repository(repo_row) as repo:
+            for i, ns in enumerate(wanted):
+                if ctx.cancelled():
+                    raise Cancelled()
+                ctx.item(ns, state="running")
+                scoped = ScopedContext(ctx, i, len(wanted), 0)
+                opts = NamespaceBackupOptions(cluster.id, cluster.name, cluster.api_url,
+                                              job.id, job.name, task_id)
+                try:
+                    manifest = backup_namespace(kube, repo, ns, opts, scoped)
+                except Cancelled:
+                    ctx.item(ns, state="cancelled")
+                    raise
+                except Exception as e:  # one namespace failing must not stop the others
+                    ctx.log(f"{cluster.name}/{ns}: backup failed: {e}", "error")
+                    ctx.item(ns, state="failed", error=str(e))
+                    failed.append(ns)
+                    continue
+                record_point(repo_row.id, manifest)
+                w = manifest.get("warnings") or manifest.get("skipped_types")
+                ctx.item(ns, state="warning" if w else "success", point_id=manifest["id"],
+                         objects=sum(manifest["resources"].values()),
+                         read=manifest["read_bytes"], new=manifest["new_bytes"])
+                (warned if w else ok).append(ns)
+                _apply_retention(ctx, repo, repo_row.id, job, subject_id(cluster.name, ns))
+            _gc_if_needed(ctx, repo)
+    finally:
+        kube.close()
+    with session_scope() as db:
+        j = db.get(Job, job.id)
+        if j:
+            j.last_run_at = datetime.now(UTC)
+    summary = f"{len(ok) + len(warned)} of {len(wanted)} namespaces backed up"
+    if failed:
+        summary += f"; failed: {', '.join(failed)}"
+    if failed and not (ok or warned):
+        return TaskState.failed, summary
+    if failed or warned:
+        return TaskState.warning, summary
+    return TaskState.success, summary
+
+
 # --------------------------------------------------------------------- restore
 
 
@@ -183,6 +264,8 @@ def run_restore(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
     if repo_row is None:
         return TaskState.failed, "Repository no longer exists"
     with services.open_repository(repo_row) as repo:
+        if p["mode"] == "namespace":
+            return _restore_namespace(p, repo, ctx)
         if p["mode"] == "files":
             return _restore_files(task_id, p, repo_row, repo, vc, ctx)
         if p["mode"] == "export":
@@ -209,6 +292,39 @@ def run_restore(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
         finally:
             source.close()
     return TaskState.failed, f"Unknown restore mode {p['mode']}"
+
+
+def _restore_namespace(p, repo, ctx) -> tuple[TaskState, str]:
+    from ..auth.secrets import decrypt
+    from ..kube.engine import NamespaceRestoreOptions, restore_namespace
+
+    with session_scope() as db:
+        cluster = db.get(KubeCluster, p["target_cluster_id"])
+        if cluster is not None:
+            db.expunge(cluster)
+    if cluster is None:
+        return TaskState.failed, "Target cluster no longer exists"
+    token_enc = p.get("restore_token_enc") or cluster.restore_token_enc
+    if not token_enc:
+        return TaskState.failed, "No restore credential; start the restore again with a token"
+    o = p["options"]
+    opts = NamespaceRestoreOptions(
+        target_namespace=o["target_namespace"], storage_class_map=o.get("storage_class_map", {}),
+        route_host_map=o.get("route_host_map", {}), keep_uid_range=o.get("keep_uid_range", True),
+        merge=o.get("merge", False), include_data=o.get("include_data", True))
+    kube = kube_client_factory(cluster.api_url, decrypt(token_enc), cluster.ca_pem)
+    try:
+        ctx.log(f"Restoring into {cluster.name}/{opts.target_namespace}")
+        res = restore_namespace(kube, repo, p["point_id"], opts, ctx)
+    finally:
+        kube.close()
+    summary = f"{res.applied} object(s) restored into {cluster.name}/{opts.target_namespace}"
+    if res.skipped:
+        summary += f", {len(res.skipped)} skipped (not available on the target cluster)"
+    if res.errors:
+        summary += f", {len(res.errors)} failed"
+        return (TaskState.failed if not res.applied else TaskState.warning), summary
+    return (TaskState.warning if res.skipped else TaskState.success), summary
 
 
 def _restore_files(task_id, p, repo_row, repo, vc, ctx) -> tuple[TaskState, str]:

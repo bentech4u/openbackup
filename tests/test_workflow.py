@@ -302,3 +302,80 @@ def test_file_restore_into_vm(admin_api, fake, setup, make_user, login, monkeypa
         entry = db.query(AuditEntry).filter_by(action="point.restore.files").one()
         assert "guest-secret-pw" not in str(entry.detail)
         assert "guest_password_enc" not in entry.detail
+
+
+def test_openshift_namespace_backup_and_restore(admin_api, setup, make_user, login, monkeypatch,
+                                                tmp_path):
+    import subprocess
+
+    from fake_kube import FakeKube
+    from test_kube_namespace import seed
+
+    from openbackup.api.routers import clusters
+    from openbackup.kube.client import KubeClient
+    from openbackup.worker import tasks
+
+    src, dr = FakeKube(), FakeKube()
+    seed(src)
+    by_url = {"https://api.homelab.example:6443": src, "https://api.dr.example:6443": dr}
+
+    def factory(url, token, ca, **kw):
+        assert token in ("backup-token", "restore-token", "pasted-token")
+        return KubeClient(url, token, ca, transport=by_url[url].transport())
+
+    monkeypatch.setattr(clusters, "client_factory", factory)
+    monkeypatch.setattr(tasks, "kube_client_factory", factory)
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-keyout", str(tmp_path / "k"), "-out", str(tmp_path / "c"),
+                    "-subj", "/CN=ca", "-addext", "basicConstraints=critical,CA:TRUE"],
+                   check=True, capture_output=True)
+    ca = (tmp_path / "c").read_text()
+    home = admin_api.post("/api/clusters", json={
+        "name": "homelab", "api_url": "https://api.homelab.example:6443", "ca_pem": ca,
+        "backup_token": "backup-token"}).json()["cluster"]["id"]
+    drc = admin_api.post("/api/clusters", json={
+        "name": "dr", "api_url": "https://api.dr.example:6443", "ca_pem": ca,
+        "backup_token": "backup-token", "restore_token": "restore-token"}).json()["cluster"]["id"]
+
+    bad = {"name": "ocp", "kind": "openshift", "cluster_id": home,
+           "repository_id": setup["repo_id"], "selection": {"namespaces": ["Bad_Name"]}}
+    assert admin_api.post("/api/jobs", json=bad).status_code == 422
+    r = admin_api.post("/api/jobs", json={**bad, "selection": {"namespaces": ["shop"]},
+                                          "retention_points": 3})
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert job["kind"] == "openshift" and job["selection"]["namespaces"] == ["shop"]
+
+    tid = admin_api.post(f"/api/jobs/{job['id']}/run").json()["id"]
+    run_worker_until_idle()
+    t = admin_api.get(f"/api/tasks/{tid}").json()
+    assert t["state"] == "success", t
+    point = next(p for p in admin_api.get("/api/points").json()
+                 if p["subject_kind"] == "namespace")
+    assert point["vm_name"] == "homelab/shop"
+    detail = admin_api.get(f"/api/points/{point['id']}").json()
+    assert detail["namespace"] == "shop" and detail["resources"]["Deployment"] == 1
+
+    # Operators restore into a new namespace on the DR cluster, using its stored token.
+    make_user("op", "operator")
+    op = login("op")
+    body = {"mode": "namespace", "namespace": {
+        "cluster_id": drc, "target_namespace": "shop-restored",
+        "storage_class_map": {"thin-csi": "thin-dr"}}}
+    r = op.post(f"/api/points/{point['id']}/restore", json=body)
+    assert r.status_code == 202, r.text
+    run_worker_until_idle()
+    assert op.get(f"/api/tasks/{r.json()['id']}").json()["state"] in ("success", "warning")
+    assert dr.get_obj("apps", "deployments", "shop-restored", "web")
+    # Merging into an existing namespace is for admins only.
+    merge = {"mode": "namespace", "namespace": {**body["namespace"], "merge": True}}
+    assert op.post(f"/api/points/{point['id']}/restore", json=merge).status_code == 403
+    # The home cluster has no stored restore token: one must be pasted, and is never echoed.
+    home_body = {"mode": "namespace", "namespace": {"cluster_id": home,
+                                                    "target_namespace": "shop2"}}
+    assert op.post(f"/api/points/{point['id']}/restore", json=home_body).status_code == 400
+    home_body["namespace"]["restore_token"] = "pasted-token"
+    r = op.post(f"/api/points/{point['id']}/restore", json=home_body)
+    assert r.status_code == 202 and "pasted-token" not in r.text
+    run_worker_until_idle()
+    assert src.get_obj("apps", "deployments", "shop2", "web")

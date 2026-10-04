@@ -6,6 +6,7 @@ import { del, get, post, put, type Job, type Repository, type Task, type VCenter
 import { useAuth } from "../auth";
 import { Alert, Badge, Button, Card, Confirm, Empty, Field, Loading, Modal, PageHeader, StateBadge, errorText } from "../components/ui";
 import { bytes, dateTime, describeCron, relative } from "../format";
+import type { Cluster, NamespaceInfo } from "./Clusters";
 
 export default function Jobs() {
   const { can } = useAuth();
@@ -39,7 +40,8 @@ export default function Jobs() {
   });
 
   const repoName = (id: number) => repos.data?.find((r) => r.id === id)?.name ?? `#${id}`;
-  const ready = (repos.data?.length ?? 0) > 0 && (vcs.data?.length ?? 0) > 0;
+  const clusters = useQuery({ queryKey: ["clusters"], queryFn: () => get<Cluster[]>("/api/clusters") });
+  const ready = (repos.data?.length ?? 0) > 0 && ((vcs.data?.length ?? 0) > 0 || (clusters.data?.length ?? 0) > 0);
 
   return (
     <>
@@ -55,7 +57,7 @@ export default function Jobs() {
         }
       />
       {!ready && !repos.isLoading && !vcs.isLoading && (
-        <Alert tone="info">Add a vCenter and a repository first; a job needs both.</Alert>
+        <Alert tone="info">Add a repository and a vCenter or OpenShift cluster first.</Alert>
       )}
       <Alert>{error}</Alert>
       <Card pad={false}>
@@ -69,7 +71,7 @@ export default function Jobs() {
               <thead>
                 <tr>
                   <th>Job</th>
-                  <th>VMs</th>
+                  <th>Protects</th>
                   <th>Repository</th>
                   <th>Schedule</th>
                   <th>Retention</th>
@@ -87,7 +89,9 @@ export default function Jobs() {
                       </div>
                       {j.description && <div className="muted small">{j.description}</div>}
                     </td>
-                    <td title={j.vms.map((v) => v.name).join(", ")}>{j.vms.length}</td>
+                    <td title={(j.kind === "openshift" ? (j.selection.namespaces as string[]) ?? [] : j.vms.map((v) => v.name)).join(", ")}>
+                      {j.kind === "openshift" ? `${((j.selection.namespaces as string[]) ?? []).length} namespace(s)` : `${j.vms.length} VM(s)`}
+                    </td>
                     <td>{repoName(j.repository_id)}</td>
                     <td>
                       <div>{describeCron(j.schedule_cron)}</div>
@@ -143,6 +147,7 @@ export default function Jobs() {
           job={editing === "new" ? null : editing}
           vcenters={vcs.data ?? []}
           repositories={repos.data ?? []}
+          clusters={clusters.data ?? []}
           onClose={() => setEditing(null)}
           onSaved={() => {
             setEditing(null);
@@ -203,14 +208,21 @@ function buildCron(kind: ScheduleKind, time: string, days: number[], custom: str
   }
 }
 
-function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
+function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: {
   job: Job | null;
   vcenters: VCenter[];
   repositories: Repository[];
+  clusters: Cluster[];
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const steps = ["General", "Virtual machines", "Storage", "Schedule", "Summary"];
+  const [kind, setKind] = useState<"vsphere" | "openshift">(
+    (job?.kind as "vsphere" | "openshift") ?? (vcenters.length || !clusters.length ? "vsphere" : "openshift"),
+  );
+  const steps = ["General", kind === "openshift" ? "Namespaces" : "Virtual machines", "Storage", "Schedule", "Summary"];
+  const [clusterId, setClusterId] = useState(job?.cluster_id ?? clusters[0]?.id ?? 0);
+  const [namespaces, setNamespaces] = useState<Set<string>>(new Set((job?.selection?.namespaces as string[]) ?? []));
+  const [freezeVms, setFreezeVms] = useState<boolean>((job?.selection?.freeze_vms as boolean) ?? true);
   const [step, setStep] = useState(0);
   const [name, setName] = useState(job?.name ?? "");
   const [description, setDescription] = useState(job?.description ?? "");
@@ -234,7 +246,12 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
   const vms = useQuery({
     queryKey: ["vms", vcenterId],
     queryFn: () => get<VmSummary[]>(`/api/vcenters/${vcenterId}/vms`),
-    enabled: !!vcenterId && step === 1,
+    enabled: kind === "vsphere" && !!vcenterId && step === 1,
+  });
+  const nsList = useQuery({
+    queryKey: ["namespaces", clusterId, false],
+    queryFn: () => get<NamespaceInfo[]>(`/api/clusters/${clusterId}/namespaces`),
+    enabled: kind === "openshift" && !!clusterId && step === 1,
   });
   const visible = useMemo(
     () => (vms.data ?? []).filter((v) => !v.is_template && v.name.toLowerCase().includes(filter.toLowerCase())),
@@ -244,7 +261,9 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
 
   function validate(s: number): string {
     if (s === 0 && !name.trim()) return "Give the job a name";
-    if (s === 1 && selected.size === 0) return "Select at least one VM";
+    if (s === 0 && kind === "openshift" && !clusterId) return "Choose a cluster";
+    if (s === 1 && kind === "vsphere" && selected.size === 0) return "Select at least one VM";
+    if (s === 1 && kind === "openshift" && namespaces.size === 0) return "Select at least one namespace";
     if (s === 2 && !repoId) return "Choose a repository";
     if (s === 2 && !points && !days) return "Keep restore points by count, by days, or both";
     if (s === 3 && schedKind === "weekly" && weekDays.length === 0) return "Pick at least one day";
@@ -263,9 +282,12 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
     const body = {
       name: name.trim(),
       description,
-      vcenter_id: vcenterId,
+      kind,
+      vcenter_id: kind === "vsphere" ? vcenterId : null,
+      cluster_id: kind === "openshift" ? clusterId : null,
       repository_id: repoId,
-      vms: [...selected].map(([moref, n]) => ({ moref, name: n })),
+      vms: kind === "vsphere" ? [...selected].map(([moref, n]) => ({ moref, name: n })) : [],
+      selection: kind === "openshift" ? { namespaces: [...namespaces], freeze_vms: freezeVms } : {},
       schedule_cron: cron,
       enabled,
       retention_points: points,
@@ -331,6 +353,27 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
             <Field label="Description">
               <textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
             </Field>
+            <Field label="What to protect">
+              <div className="segmented">
+                <button type="button" disabled={!!job} className={kind === "vsphere" ? "on" : ""} onClick={() => setKind("vsphere")}>
+                  VMware VMs
+                </button>
+                <button type="button" disabled={!!job} className={kind === "openshift" ? "on" : ""} onClick={() => setKind("openshift")}>
+                  OpenShift namespaces
+                </button>
+              </div>
+            </Field>
+            {kind === "openshift" ? (
+              <Field label="Cluster">
+                <select value={clusterId} onChange={(e) => { setClusterId(Number(e.target.value)); setNamespaces(new Set()); }}>
+                  {clusters.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} ({c.api_url})
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            ) : (
             <Field label="vCenter">
               <select
                 value={vcenterId}
@@ -346,9 +389,61 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
                 ))}
               </select>
             </Field>
+            )}
           </>
         )}
-        {step === 1 && (
+        {step === 1 && kind === "openshift" && (
+          <>
+            {nsList.error && <Alert>{errorText(nsList.error)}</Alert>}
+            <div className="row gap-s">
+              <span className="muted">{namespaces.size} selected</span>
+              <div className="grow" />
+              <Button onClick={() => nsList.refetch()} busy={nsList.isFetching}>
+                Refresh
+              </Button>
+            </div>
+            <div className="pick-list">
+              {nsList.isLoading ? (
+                <Loading />
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th style={{ width: 32 }} />
+                      <th>Namespace</th>
+                      <th>Volumes</th>
+                      <th>VMs</th>
+                      <th>Notes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {nsList.data?.map((n) => {
+                      const on = namespaces.has(n.name);
+                      const unsupported = n.pvcs.filter((p) => !p.data_supported).length;
+                      return (
+                        <tr
+                          key={n.name}
+                          className={`clickable ${on ? "selected" : ""}`}
+                          onClick={() => setNamespaces((prev) => { const x = new Set(prev); if (x.has(n.name)) x.delete(n.name); else x.add(n.name); return x; })}
+                        >
+                          <td>
+                            <input type="checkbox" readOnly checked={on} />
+                          </td>
+                          <td>{n.name}</td>
+                          <td className="small">{n.pvcs.length ? `${n.pvcs.length} · ${bytes(n.pvc_bytes)}` : "—"}</td>
+                          <td>{n.vms || ""}</td>
+                          <td className="small">{unsupported > 0 && <Badge tone="warn">{unsupported} volume(s): resources only</Badge>}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="muted small">Secrets are never backed up. Restored applications need their Secrets recreated.</div>
+          </>
+        )}
+        {step === 1 && kind === "vsphere" && (
           <>
             <div className="row gap-s">
               <input className="search" placeholder="Filter VMs…" value={filter} onChange={(e) => setFilter(e.target.value)} />
@@ -422,6 +517,7 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
                 <input type="number" min={0} value={fullDays} onChange={(e) => setFullDays(Number(e.target.value))} />
               </Field>
             </div>
+            {kind === "vsphere" ? (
             <label className="check">
               <input type="checkbox" checked={quiesce} onChange={(e) => setQuiesce(e.target.checked)} />
               <span>
@@ -429,6 +525,15 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
                 <div className="muted small">Recommended for databases and Windows servers. Requires VMware Tools in the guest.</div>
               </span>
             </label>
+            ) : (
+            <label className="check">
+              <input type="checkbox" checked={freezeVms} onChange={(e) => setFreezeVms(e.target.checked)} />
+              <span>
+                Freeze OpenShift Virtualization VMs while their disks are snapshotted
+                <div className="muted small">Uses the QEMU guest agent for consistent VM backups. Needs the freeze role from backup-serviceaccount.yaml.</div>
+              </span>
+            </label>
+            )}
           </>
         )}
         {step === 3 && (
@@ -475,10 +580,21 @@ function JobEditor({ job, vcenters, repositories, onClose, onSaved }: {
           <dl className="kv">
             <dt>Name</dt>
             <dd>{name}</dd>
-            <dt>vCenter</dt>
-            <dd>{vcenters.find((v) => v.id === vcenterId)?.name}</dd>
-            <dt>VMs</dt>
-            <dd>{[...selected.values()].join(", ")}</dd>
+            {kind === "openshift" ? (
+              <>
+                <dt>Cluster</dt>
+                <dd>{clusters.find((c) => c.id === clusterId)?.name}</dd>
+                <dt>Namespaces</dt>
+                <dd>{[...namespaces].join(", ")}</dd>
+              </>
+            ) : (
+              <>
+                <dt>vCenter</dt>
+                <dd>{vcenters.find((v) => v.id === vcenterId)?.name}</dd>
+                <dt>VMs</dt>
+                <dd>{[...selected.values()].join(", ")}</dd>
+              </>
+            )}
             <dt>Repository</dt>
             <dd>{repositories.find((r) => r.id === repoId)?.name}</dd>
             <dt>Retention</dt>

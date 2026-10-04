@@ -3,11 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, FolderOpen, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 import { del, get, post, type Placement, type PointDetail, type RestorePoint, type Task, type VCenter } from "../api";
+import type { Cluster } from "./Clusters";
 import { useAuth } from "../auth";
 import { Alert, Badge, Button, Card, Confirm, Empty, Field, Loading, Modal, PageHeader, errorText } from "../components/ui";
 import { bytes, dateTime, relative } from "../format";
 
 interface ProtectedVm {
+  subject_kind: "vm" | "namespace" | "etcd";
   vm_uuid: string;
   vm_name: string;
   points: number;
@@ -43,7 +45,13 @@ export default function Restore() {
                 <tbody>
                   {visible.map((v) => (
                     <tr key={v.vm_uuid} className={`clickable ${vm?.vm_uuid === v.vm_uuid ? "selected" : ""}`} onClick={() => setVm(v)}>
-                      <td>{v.vm_name}</td>
+                      <td>
+                        <span className="row gap-s">
+                          {v.vm_name}
+                          {v.subject_kind === "namespace" && <Badge tone="info">namespace</Badge>}
+                          {v.subject_kind === "etcd" && <Badge tone="info">etcd</Badge>}
+                        </span>
+                      </td>
                       <td>{v.points}</td>
                       <td className="nowrap">{relative(v.latest)}</td>
                     </tr>
@@ -115,6 +123,7 @@ export function PointPage() {
   if (point.isLoading) return <Loading />;
   if (point.error) return <Alert>{errorText(point.error)}</Alert>;
   const p = point.data!;
+  if (p.subject_kind === "namespace") return <NamespacePoint point={p as NamespacePointDetail} />;
 
   async function startTask(fn: () => Promise<Task>) {
     setBusy(true);
@@ -459,6 +468,224 @@ function RestoreWizard({ point, onClose }: { point: PointDetail; onClose: () => 
             <Alert tone="info">Files are written to the repository under exports/{point.id}/.</Alert>
           </>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+interface NamespacePointDetail extends PointDetail {
+  cluster: { id: number; name: string; api_url: string };
+  namespace: string;
+  resources: Record<string, number>;
+  pvcs: { name: string; storage_class: string; size: string; volume_mode: string; data: boolean }[];
+  skipped_types: string[];
+}
+
+function NamespacePoint({ point: p }: { point: NamespacePointDetail }) {
+  const nav = useNavigate();
+  const { can } = useAuth();
+  const [restoring, setRestoring] = useState(false);
+  const total = Object.values(p.resources).reduce((a, b) => a + b, 0);
+  return (
+    <>
+      <PageHeader
+        title={`${p.vm_name} — ${dateTime(p.created_at)}`}
+        subtitle={
+          <span className="row gap-s">
+            <Button variant="ghost" onClick={() => nav("/restore")}>
+              <ArrowLeft size={14} /> All backups
+            </Button>
+            <Badge tone="info">OpenShift namespace</Badge>
+            <span className="mono muted">{p.id}</span>
+          </span>
+        }
+        actions={
+          can("operator") && (
+            <Button variant="primary" onClick={() => setRestoring(true)}>
+              <RotateCcw size={15} /> Restore namespace…
+            </Button>
+          )
+        }
+      />
+      {p.warnings?.length > 0 && <Alert tone="warn">{p.warnings.join(" · ")}</Alert>}
+      <div className="grid grid-2">
+        <Card title="Namespace">
+          <dl className="kv">
+            <dt>Cluster</dt>
+            <dd>{p.cluster.name}</dd>
+            <dt>Namespace</dt>
+            <dd>{p.namespace}</dd>
+            <dt>Objects</dt>
+            <dd>{total}</dd>
+            <dt>Secrets</dt>
+            <dd className="muted">not backed up</dd>
+          </dl>
+        </Card>
+        <Card title="Objects by kind">
+          <dl className="kv">
+            {Object.entries(p.resources).map(([k, v]) => (
+              <div key={k} style={{ display: "contents" }}>
+                <dt>{k}</dt>
+                <dd>{v}</dd>
+              </div>
+            ))}
+          </dl>
+        </Card>
+      </div>
+      {p.pvcs.length > 0 && (
+        <Card title="Persistent volumes" pad={false}>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Claim</th>
+                  <th>Size</th>
+                  <th>Storage class</th>
+                  <th>Mode</th>
+                  <th>Data</th>
+                </tr>
+              </thead>
+              <tbody>
+                {p.pvcs.map((v) => (
+                  <tr key={v.name}>
+                    <td>{v.name}</td>
+                    <td>{v.size}</td>
+                    <td>{v.storage_class}</td>
+                    <td>{v.volume_mode}</td>
+                    <td>{v.data ? <Badge tone="good">backed up</Badge> : <Badge>claim only</Badge>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+      {p.skipped_types?.length > 0 && (
+        <Alert tone="warn">Not readable at backup time, so not included: {p.skipped_types.join("; ")}</Alert>
+      )}
+      {restoring && <NamespaceRestore point={p} onClose={() => setRestoring(false)} />}
+    </>
+  );
+}
+
+function NamespaceRestore({ point, onClose }: { point: NamespacePointDetail; onClose: () => void }) {
+  const nav = useNavigate();
+  const { can } = useAuth();
+  const clusters = useQuery({ queryKey: ["clusters"], queryFn: () => get<Cluster[]>("/api/clusters") });
+  const [clusterId, setClusterId] = useState<number | undefined>(undefined);
+  const target = clusterId ?? point.cluster.id;
+  const cluster = clusters.data?.find((c) => c.id === target);
+  const [nsName, setNsName] = useState(`${point.namespace}-restored`);
+  const [merge, setMerge] = useState(false);
+  const [keepUid, setKeepUid] = useState(true);
+  const [includeData, setIncludeData] = useState(true);
+  const classes = [...new Set(point.pvcs.map((v) => v.storage_class).filter(Boolean))];
+  const [scMap, setScMap] = useState<Record<string, string>>({});
+  const [routeFrom, setRouteFrom] = useState("");
+  const [routeTo, setRouteTo] = useState("");
+  const [token, setToken] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    setError("");
+    setBusy(true);
+    try {
+      const t = await post<Task>(`/api/points/${point.id}/restore`, {
+        mode: "namespace",
+        namespace: {
+          cluster_id: target,
+          target_namespace: nsName.trim(),
+          storage_class_map: Object.fromEntries(Object.entries(scMap).filter(([a, b]) => b && a !== b)),
+          route_host_map: routeFrom.trim() && routeTo.trim() ? { [routeFrom.trim()]: routeTo.trim() } : {},
+          keep_uid_range: keepUid,
+          merge,
+          include_data: includeData,
+          restore_token: token.trim() || null,
+        },
+      });
+      nav(`/tasks/${t.id}`);
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={`Restore ${point.vm_name}`}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant={merge ? "danger" : "primary"} onClick={submit} busy={busy}>
+            {merge ? "Restore into existing namespace" : "Restore"}
+          </Button>
+        </>
+      }
+    >
+      <div className="stack">
+        <Alert>{error}</Alert>
+        <div className="form-grid">
+          <Field label="Target cluster" hint={target === point.cluster.id ? "The cluster it was backed up from" : "Another cluster (e.g. DR)"}>
+            <select value={target} onChange={(e) => setClusterId(Number(e.target.value))}>
+              {clusters.data?.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                  {c.id === point.cluster.id ? " (original)" : ""}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Target namespace" hint="Lowercase letters, digits and dashes">
+            <input value={nsName} onChange={(e) => setNsName(e.target.value)} />
+          </Field>
+        </div>
+        <label className="check" style={{ opacity: can("admin") ? 1 : 0.5 }}>
+          <input type="checkbox" disabled={!can("admin")} checked={merge} onChange={(e) => setMerge(e.target.checked)} />
+          <span>
+            The namespace already exists: restore into it, replacing objects with the backed-up versions
+            {!can("admin") && <span className="muted small"> (admins only)</span>}
+          </span>
+        </label>
+        {cluster && !cluster.has_restore_token && (
+          <Field label="Restore token" hint="This cluster has no stored restore token. It is used for this restore only and not kept.">
+            <textarea className="mono small" rows={2} value={token} onChange={(e) => setToken(e.target.value)} />
+          </Field>
+        )}
+        {classes.length > 0 && (
+          <Card title="Storage classes">
+            <div className="form-grid">
+              {classes.map((c) => (
+                <Field key={c} label={`Backed up as ${c}`} hint="Storage class on the target cluster">
+                  <input value={scMap[c] ?? c} onChange={(e) => setScMap({ ...scMap, [c]: e.target.value })} />
+                </Field>
+              ))}
+            </div>
+          </Card>
+        )}
+        <Card title="Routes">
+          <div className="form-grid">
+            <Field label="Replace host suffix" hint="e.g. .apps.homelab.bentech.work">
+              <input value={routeFrom} onChange={(e) => setRouteFrom(e.target.value)} />
+            </Field>
+            <Field label="With" hint="e.g. .apps.drhomelab.bentech.work">
+              <input value={routeTo} onChange={(e) => setRouteTo(e.target.value)} />
+            </Field>
+          </div>
+        </Card>
+        <label className="check">
+          <input type="checkbox" checked={keepUid} onChange={(e) => setKeepUid(e.target.checked)} />
+          <span>
+            Keep the original UID range
+            <div className="muted small">Restored files and pods then run as the same user IDs as before. Recommended.</div>
+          </span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={includeData} onChange={(e) => setIncludeData(e.target.checked)} />
+          Restore persistent volume data
+        </label>
       </div>
     </Modal>
   );

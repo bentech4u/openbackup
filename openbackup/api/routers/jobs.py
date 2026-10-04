@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ...db.models import Job, Repository, Task, TaskState, VCenter
+from ...db.models import Job, JobKind, KubeCluster, Repository, Task, TaskState, VCenter
 from ...services import next_run, valid_cron
 from ...worker.main import enqueue_backup
 from ..deps import Principal, admin, audit, get_db, operator, viewer
@@ -19,12 +21,32 @@ class VmRef(BaseModel):
     name: str = Field(max_length=255)
 
 
+NAMESPACE_RE = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+
+
+class OpenShiftSelection(BaseModel):
+    namespaces: list[str] = Field(min_length=1, max_length=500)
+    # Freeze KubeVirt guests (QEMU guest agent) while their disks are snapshotted.
+    freeze_vms: bool = True
+
+    @field_validator("namespaces")
+    @classmethod
+    def _names(cls, v: list[str]) -> list[str]:
+        for n in v:
+            if not re.fullmatch(NAMESPACE_RE, n) or len(n) > 63:
+                raise ValueError(f"Invalid namespace name {n!r}")
+        return sorted(set(v))
+
+
 class JobIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     description: str = Field("", max_length=2000)
-    vcenter_id: int
+    kind: JobKind = JobKind.vsphere
+    vcenter_id: int | None = None
+    cluster_id: int | None = None
     repository_id: int
-    vms: list[VmRef] = Field(min_length=1, max_length=500)
+    vms: list[VmRef] = Field(default_factory=list, max_length=500)
+    selection: dict = Field(default_factory=dict)
     schedule_cron: str | None = Field(None, max_length=128)
     enabled: bool = True
     retention_points: int = Field(14, ge=0, le=10000)
@@ -40,10 +62,28 @@ class JobIn(BaseModel):
             raise ValueError("Invalid cron expression")
         return v
 
+    @model_validator(mode="after")
+    def _by_kind(self) -> JobIn:
+        if self.kind == JobKind.vsphere:
+            if self.vcenter_id is None or not self.vms:
+                raise ValueError("A vSphere job needs a vCenter and at least one VM")
+            self.cluster_id, self.selection = None, {}
+        elif self.kind == JobKind.openshift:
+            if self.cluster_id is None:
+                raise ValueError("An OpenShift job needs a cluster")
+            self.selection = OpenShiftSelection(**self.selection).model_dump()
+            self.vms = []
+        return self
+
 
 def _check_refs(db: Session, body: JobIn) -> None:
-    if db.get(VCenter, body.vcenter_id) is None:
+    if body.kind == JobKind.vsphere and db.get(VCenter, body.vcenter_id) is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown vCenter")
+    if body.kind == JobKind.openshift:
+        cluster = db.get(KubeCluster, body.cluster_id)
+        if cluster is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown cluster")
+        body.vcenter_id = cluster.vcenter_id
     if db.get(Repository, body.repository_id) is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown repository")
     if body.retention_points == 0 and body.retention_days == 0:

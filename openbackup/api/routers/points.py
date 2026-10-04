@@ -10,8 +10,8 @@ from sqlalchemy.orm import Session
 
 from ... import services
 from ...auth.secrets import encrypt
+from ...db.models import KubeCluster, RestorePoint, Role, Task, TaskKind, VCenter
 from ...db.models import Repository as RepoRow
-from ...db.models import RestorePoint, Role, Task, TaskKind, VCenter
 from ...repo.repository import RepositoryError
 from ..deps import Principal, admin, audit, get_db, operator, viewer
 from ..schemas import RestorePointOut, TaskOut
@@ -47,11 +47,13 @@ def protected_vms(db: Session = Depends(get_db), _: Principal = Depends(viewer))
     """One row per backed-up VM with its point count and latest point."""
     rows = db.execute(
         select(RestorePoint.vm_uuid, func.max(RestorePoint.vm_name), func.count(),
-               func.max(RestorePoint.created_at), func.sum(RestorePoint.new_bytes))
+               func.max(RestorePoint.created_at), func.sum(RestorePoint.new_bytes),
+               func.max(RestorePoint.subject_kind))
         .group_by(RestorePoint.vm_uuid)
         .order_by(func.max(RestorePoint.vm_name))).all()
-    return [{"vm_uuid": u, "vm_name": n, "points": c, "latest": latest, "stored_bytes": s}
-            for u, n, c, latest, s in rows]
+    return [{"vm_uuid": u, "vm_name": n, "points": c, "latest": latest, "stored_bytes": s,
+             "subject_kind": k}
+            for u, n, c, latest, s, k in rows]
 
 
 def _point(db: Session, point_id: str) -> RestorePoint:
@@ -81,6 +83,10 @@ async def get_point(point_id: str, db: Session = Depends(get_db),
     out.update(config=m.get("config", {}), vcenter=m.get("vcenter", ""),
                warnings=m.get("warnings", []), duration_s=m.get("duration_s"),
                disk_details=m.get("disks", []))
+    if p.subject_kind == "namespace":
+        out.update(cluster=m.get("cluster", {}), namespace=m.get("namespace", ""),
+                   resources=m.get("resources", {}), pvcs=m.get("pvcs", []),
+                   skipped_types=m.get("skipped_types", []))
     return out
 
 
@@ -131,13 +137,28 @@ class FilesIn(BaseModel):
     target_dir: str | None = Field(None, max_length=1024)
 
 
+class NamespaceIn(BaseModel):
+    """Restore an OpenShift namespace point into a cluster."""
+
+    cluster_id: int
+    target_namespace: str = Field(pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63)
+    storage_class_map: dict[str, str] = {}
+    route_host_map: dict[str, str] = {}
+    keep_uid_range: bool = True
+    merge: bool = False
+    include_data: bool = True
+    # Used for this restore only, when the cluster has no stored restore token.
+    restore_token: str | None = Field(None, max_length=16384)
+
+
 class RestoreIn(BaseModel):
-    mode: Literal["new_vm", "in_place", "export", "files"]
+    mode: Literal["new_vm", "in_place", "export", "files", "namespace"]
     vcenter_id: int | None = None
     target: NewVmIn | None = None
     format: Literal["raw", "vmdk", "qcow2"] = "raw"
     power_on: bool = False
     files: FilesIn | None = None
+    namespace: NamespaceIn | None = None
 
 
 @router.post("/{point_id}/restore", response_model=TaskOut, status_code=202)
@@ -160,11 +181,33 @@ def restore(point_id: str, body: RestoreIn, request: Request, db: Session = Depe
             check_browse_path(item)
         if f.target_dir is not None and ("\x00" in f.target_dir or not f.target_dir.strip()):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid target folder")
+    if body.mode == "namespace":
+        n = body.namespace
+        if n is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose the target cluster")
+        if p.subject_kind != "namespace":
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Not a namespace backup")
+        if n.merge and pr.role.rank < Role.admin.rank:
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                "Restoring into an existing namespace requires the admin role")
+        cluster = db.get(KubeCluster, n.cluster_id)
+        if cluster is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown cluster")
+        if not (n.restore_token or cluster.restore_token_enc):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                "This cluster has no stored restore token; paste one")
+        opts = n.model_dump(exclude={"restore_token", "cluster_id"})
+        params.update(target_cluster_id=n.cluster_id, options=opts)
+        if n.restore_token:
+            params["restore_token_enc"] = encrypt(n.restore_token)
+        title = f"Restore {p.vm_name} into {cluster.name}/{n.target_namespace}"
     if body.mode in ("new_vm", "in_place", "files"):
         if body.vcenter_id is None or db.get(VCenter, body.vcenter_id) is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose the target vCenter")
         params["vcenter_id"] = body.vcenter_id
-    if body.mode == "files":
+    if body.mode == "namespace":
+        pass  # parameters set above
+    elif body.mode == "files":
         f = body.files
         params.update(items=f.items, vm_moref=f.vm_moref, guest_user=f.guest_user,
                       guest_password_enc=encrypt(f.guest_password), conflict=f.conflict,
@@ -198,5 +241,6 @@ def restore(point_id: str, body: RestoreIn, request: Request, db: Session = Depe
     audit(db, request, f"point.restore.{body.mode}", principal=pr,
           target=f"{p.vm_name} {point_id}", detail={k: v for k, v in params.items()
                                                      if k not in ("point_id",
-                                                                  "guest_password_enc")})
+                                                                  "guest_password_enc",
+                                                                  "restore_token_enc")})
     return t

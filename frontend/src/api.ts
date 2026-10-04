@@ -76,7 +76,10 @@ export interface Job {
   id: number;
   name: string;
   description: string;
-  vcenter_id: number;
+  kind: "vsphere" | "openshift" | "etcd";
+  cluster_id: number | null;
+  selection: Record<string, unknown>;
+  vcenter_id: number | null;
   repository_id: number;
   vms: { moref: string; name: string }[];
   schedule_cron: string | null;
@@ -129,6 +132,7 @@ export interface RestorePoint {
   id: string;
   repository_id: number;
   job_id: number | null;
+  subject_kind: "vm" | "namespace" | "etcd";
   vm_uuid: string;
   vm_name: string;
   vm_moref: string;
