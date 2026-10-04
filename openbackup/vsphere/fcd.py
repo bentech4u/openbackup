@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from pyVmomi import vim
+from pyVmomi import vim, vmodl
 
 from .client import SNAPSHOT_PREFIX, VSphere, VSphereError, parse_ds_path
 from .types import Extent
@@ -67,8 +67,14 @@ class FcdManager:
                        cbt=bool(getattr(cfg, "changedBlockTrackingEnabled", False)))
 
     def enable_cbt(self, fcd_id: str) -> None:
-        self._mgr.SetVStorageObjectControlFlags(id=self._id(fcd_id), datastore=self._ds(fcd_id),
-                                                controlFlags=["enableChangedBlockTracking"])
+        """Turn CBT on for a volume. vSphere refuses this while the volume is
+        attached to a running VM (its CBT then follows that VM's setting)."""
+        try:
+            self._mgr.SetVStorageObjectControlFlags(
+                id=self._id(fcd_id), datastore=self._ds(fcd_id),
+                controlFlags=["enableChangedBlockTracking"])
+        except vmodl.MethodFault as e:
+            raise VSphereError(getattr(e, "msg", None) or str(e)) from None
 
     def create_snapshot(self, fcd_id: str, description: str) -> str:
         task = self._mgr.VStorageObjectCreateSnapshot_Task(
@@ -101,7 +107,7 @@ class FcdManager:
                 info = self._mgr.QueryChangedDiskAreas(
                     id=self._id(fcd_id), datastore=self._ds(fcd_id),
                     snapshotId=self._id(snap_id), startOffset=offset, changeId=change_id)
-            except vim.fault.VimFault as e:
+            except vmodl.MethodFault as e:  # no CBT, a stale change id...
                 raise VSphereError(f"CBT query failed for volume {fcd_id}: "
                                    f"{getattr(e, 'msg', e)}") from None
             for a in info.changedArea or []:

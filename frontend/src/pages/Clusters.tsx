@@ -71,6 +71,7 @@ export default function Clusters() {
   const clusters = useQuery({ queryKey: ["clusters"], queryFn: () => get<Cluster[]>("/api/clusters") });
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<Cluster | null>(null);
+  const [permissions, setPermissions] = useState<Cluster | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [error, setError] = useState("");
   const current = selected ?? clusters.data?.[0]?.id ?? null;
@@ -121,9 +122,12 @@ export default function Clusters() {
                     <td>{c.has_restore_token ? <Badge tone="info">stored</Badge> : <Badge>asked per restore</Badge>}</td>
                     <td className="right">
                       {can("admin") && (
-                        <Button variant="ghost" onClick={(e) => { e.stopPropagation(); setRemoving(c); }}>
-                          Remove
-                        </Button>
+                        <span className="row gap-s" style={{ justifyContent: "flex-end" }}>
+                          <Button onClick={(e) => { e.stopPropagation(); setPermissions(c); }}>Update permissions</Button>
+                          <Button variant="ghost" onClick={(e) => { e.stopPropagation(); setRemoving(c); }}>
+                            Remove
+                          </Button>
+                        </span>
                       )}
                     </td>
                   </tr>
@@ -145,6 +149,7 @@ export default function Clusters() {
           }}
         />
       )}
+      {permissions && <UpdatePermissions cluster={permissions} onClose={() => setPermissions(null)} />}
       {removing && (
         <Confirm
           title={`Remove ${removing.name}?`}
@@ -613,6 +618,139 @@ function LinkVCenter({ cluster, onClose, onDone }: { cluster: Cluster; onClose: 
             ))}
           </select>
         </Field>
+      </div>
+    </Modal>
+  );
+}
+
+function UpdatePermissions({ cluster, onClose }: { cluster: Cluster; onClose: () => void }) {
+  const [kind, setKind] = useState<"password" | "token">("password");
+  const [username, setUsername] = useState("kubeadmin");
+  const [password, setPassword] = useState("");
+  const [token, setToken] = useState("");
+  const [chain, setChain] = useState<ChainCert[] | null>(null);
+  const [oauthCa, setOauthCa] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState<{ admin_user: string; created: string[]; backup: Probe; restore: Probe | null } | null>(null);
+
+  async function fetchOauth() {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await get<{ chain: ChainCert[] }>(`/api/clusters/${cluster.id}/oauth-info`);
+      setChain(r.chain);
+      const ca = [...r.chain].reverse().find((x) => x.is_ca) ?? r.chain[r.chain.length - 1];
+      setOauthCa(ca?.pem ?? "");
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function run() {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await post<{ admin_user: string; created: string[]; backup: Probe; restore: Probe | null }>(
+        `/api/clusters/${cluster.id}/permissions`,
+        {
+          admin:
+            kind === "password"
+              ? { kind: "password", username: username.trim(), password, oauth_ca_pem: oauthCa }
+              : { kind: "token", token: token.trim() },
+        },
+      );
+      setPassword("");
+      setToken("");
+      setDone(r);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <Modal title={`Permissions updated on ${cluster.name}`} onClose={onClose} footer={<Button variant="primary" onClick={onClose}>Done</Button>}>
+        <div className="stack">
+          <Alert tone="good">
+            Applied as {done.admin_user}; the admin credentials were not stored{kind === "password" ? " and the login session was revoked" : ""}.
+          </Alert>
+          <div className="muted small">Applied: {done.created.join(", ")}</div>
+          <Perms p={done.backup} title="Backup token" />
+          {done.restore && <Perms p={done.restore} title="Restore token" />}
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal
+      title={`Update permissions on ${cluster.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button
+            variant="primary"
+            busy={busy}
+            disabled={kind === "password" ? !username || !password || !oauthCa : !token}
+            onClick={run}
+          >
+            Apply
+          </Button>
+        </>
+      }
+    >
+      <div className="stack">
+        <div className="muted small">
+          Re-applies OpenBackup&apos;s own service accounts and roles (for example after an update added read access to monitoring rules). The
+          existing tokens stay valid. Admin credentials are used once and not stored.
+        </div>
+        <Alert>{error}</Alert>
+        <div className="segmented">
+          <button type="button" className={kind === "password" ? "on" : ""} onClick={() => setKind("password")}>
+            Username and password
+          </button>
+          <button type="button" className={kind === "token" ? "on" : ""} onClick={() => setKind("token")}>
+            Admin token
+          </button>
+        </div>
+        {kind === "password" ? (
+          <>
+            <div className="form-grid">
+              <Field label="Username">
+                <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="off" />
+              </Field>
+              <Field label="Password">
+                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+              </Field>
+            </div>
+            <div>
+              <Button onClick={fetchOauth} busy={busy && !chain}>
+                Fetch OAuth server certificate
+              </Button>
+            </div>
+            {chain?.map((c) => (
+              <label key={c.sha256} className="check">
+                <input type="radio" checked={oauthCa === c.pem} onChange={() => setOauthCa(c.pem)} />
+                <span>
+                  <div>
+                    {c.subject} {c.is_ca && <Badge tone="info">CA</Badge>}
+                  </div>
+                  <div className="mono small">SHA-256 {c.sha256}</div>
+                </span>
+              </label>
+            ))}
+          </>
+        ) : (
+          <Field label="Admin token" hint="From `oc whoami -t` while logged in as a cluster admin">
+            <textarea className="mono small" rows={2} value={token} onChange={(e) => setToken(e.target.value)} />
+          </Field>
+        )}
       </div>
     </Modal>
   );

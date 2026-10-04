@@ -112,3 +112,22 @@ def test_revoke_names_the_token_object(cluster):
     revoke_session_token(c, "sha256~abc")
     assert cluster.get_obj("oauth.openshift.io", "oauthaccesstokens", "",
                            "sha256~" + _digest("abc")) is None
+
+
+def test_update_permissions_on_existing_cluster(admin_api, cluster, ca_pem):  # noqa: F811
+    cid = admin_api.post("/api/clusters/setup", json=_body(
+        ca_pem, kind="token", token="pasted-admin-token")).json()["cluster"]["id"]
+    # An older setup without the app-extras role.
+    cluster.objects.pop(("rbac.authorization.k8s.io", "clusterroles", "",
+                         "openbackup-read-app-extras"))
+    r = admin_api.post(f"/api/clusters/{cid}/permissions",
+                       json={"admin": {"kind": "password", "username": "kubeadmin",
+                                       "password": "the-kubeadmin-password"}})
+    assert r.status_code == 200, r.text
+    assert "ClusterRole/openbackup-read-app-extras" in r.json()["created"]
+    assert cluster.get_obj("rbac.authorization.k8s.io", "clusterroles", "",
+                           "openbackup-read-app-extras")
+    assert r.json()["cluster"]["has_restore_token"]  # kept
+    r = admin_api.post(f"/api/clusters/{cid}/permissions",
+                       json={"admin": {"kind": "token", "token": "nobody"}})
+    assert r.status_code == 400

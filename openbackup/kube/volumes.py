@@ -125,8 +125,15 @@ def volume_backup(fcd, open_flat, prev_manifest: dict | None, load_prev_map,
                 continue
             reader.close()
             if not info.cbt:
-                ctx.log(f"{name}: {pvc}: enabling Changed Block Tracking")
-                fcd.enable_cbt(fcd_id)
+                try:
+                    fcd.enable_cbt(fcd_id)
+                    ctx.log(f"{name}: {pvc}: enabled Changed Block Tracking")
+                except VSphereError as e:
+                    # Typical for a volume attached to a running node: its CBT
+                    # follows the node VM. Back it up anyway, reading it whole.
+                    warn(f"{pvc}: Changed Block Tracking could not be enabled ({e}); this "
+                         "volume is read in full on every run. Enable CBT on the OpenShift "
+                         "node VMs for incremental volume backups.")
             infos[fcd_id] = info
         targets = [t for t in targets if t[1] in infos]
         if not targets:

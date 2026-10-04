@@ -62,7 +62,12 @@ def backup_namespace(c: KubeClient, repo: Repository, namespace: str,
     ctx.log(f"{name}: {sum(counts.values())} objects "
             f"({', '.join(f'{v} {k}' for k, v in counts.items()) or 'none'})")
     for s in captured["skipped_types"]:
-        ctx.log(f"{name}: not readable, skipped: {s}", "warning")
+        ctx.log(f"{name}: not readable, skipped: {s}. Update the cluster's permissions "
+                "(OpenShift page) to include it.", "warning")
+    if captured.get("platform_types"):
+        ctx.log(f"{name}: {len(captured['platform_types'])} OpenShift platform kinds are not "
+                "readable by the backup account and are not part of application backups: "
+                f"{', '.join(sorted(captured['platform_types']))}")
     check_cancel(ctx)
 
     warnings: list[str] = []

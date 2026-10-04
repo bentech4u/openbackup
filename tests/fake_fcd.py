@@ -20,6 +20,7 @@ class FakeFcd:
         self.vols: dict[str, dict] = {}
         self.calls: list[str] = []
         self.fail_snapshot_of: str | None = None
+        self.attached: set[str] = set()
         self.parent_cid = "ffffffff"
 
     def add(self, size: int) -> str:
@@ -55,6 +56,8 @@ class FakeFcd:
                        v["cbt"])
 
     def enable_cbt(self, fid: str) -> None:
+        if fid in self.attached:
+            raise VSphereError("The operation is not allowed in the current state.")
         self.vols[fid]["cbt"] = True
 
     def create_snapshot(self, fid: str, description: str) -> str:
@@ -67,8 +70,10 @@ class FakeFcd:
         v["gen"] += 1
         return sid
 
-    def snapshot_change_id(self, fid: str, sid: str) -> str:
+    def snapshot_change_id(self, fid: str, sid: str) -> str | None:
         v = self.vols[fid]
+        if not v["cbt"]:
+            return None
         return f"{v['epoch']}/{v['snaps'][sid]['gen']}"
 
     def delete_snapshot(self, fid: str, sid: str) -> None:
@@ -81,6 +86,8 @@ class FakeFcd:
 
     def changed_areas(self, fid, sid, capacity, change_id) -> list[Extent]:
         v = self.vols[fid]
+        if not v["cbt"]:
+            raise VSphereError("Change tracking is not enabled for this disk")
         if change_id == "*":
             data = self.read(fid)
             step = 64 * 1024

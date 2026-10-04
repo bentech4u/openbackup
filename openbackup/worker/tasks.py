@@ -258,7 +258,7 @@ def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskSt
                     failed.append(ns)
                     continue
                 record_point(repo_row.id, manifest)
-                w = manifest.get("warnings") or manifest.get("skipped_types")
+                w = manifest.get("warnings")
                 ctx.item(ns, state="warning" if w else "success", point_id=manifest["id"],
                          objects=sum(manifest["resources"].values()),
                          read=manifest["read_bytes"], new=manifest["new_bytes"])

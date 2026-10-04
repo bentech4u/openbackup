@@ -142,3 +142,21 @@ def test_volume_with_its_own_snapshots_is_refused(env):
     with pytest.raises(DirectNfsError, match="snapshots of its own"):
         run(fk, fcd, repo)
     assert fcd.vols[a]["snaps"] == {}
+
+
+def test_attached_volume_without_cbt_is_read_in_full(env):
+    fcd, repo = env
+    a = fcd.add(4 * MiB)
+    fcd.write(a, MiB, os.urandom(1000))
+    fcd.attached.add(a)  # vSphere refuses to toggle CBT on an attached FCD
+    fk = FakeKube()
+    seed(fk, {"data": ("csi.vsphere.vmware.com", a)})
+    m1 = run(fk, fcd, repo)
+    assert any("could not be enabled" in w for w in m1["warnings"])
+    # Without CBT the volume is read whole, or only its data where the storage
+    # reports holes itself (this local test filesystem does; NFS v3 does not).
+    assert MiB <= m1["read_bytes"] <= 4 * MiB
+    assert restored(repo, m1["id"], disk_key("data")) == fcd.read(a)
+    fcd.write(a, 3 * MiB, b"x")
+    m2 = run(fk, fcd, repo)
+    assert m2["kind"] == "full" and restored(repo, m2["id"], disk_key("data")) == fcd.read(a)

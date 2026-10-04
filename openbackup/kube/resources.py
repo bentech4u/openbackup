@@ -33,6 +33,19 @@ EXCLUDED_TYPES = {
 # Legacy OpenShift views of RBAC duplicate rbac.authorization.k8s.io.
 EXCLUDED_GROUPS = {"authorization.openshift.io", "metrics.k8s.io"}
 
+# Kinds an application can genuinely own that cluster-reader cannot list;
+# the backup account gets read access to these (kube/manifests). If they are
+# still unreadable, that is worth a warning. Anything else cluster-reader
+# cannot read is platform machinery (bare-metal hosts, IPAM, tuned...).
+APP_LEVEL_RESTRICTED = {
+    ("monitoring.coreos.com", "servicemonitors"), ("monitoring.coreos.com", "podmonitors"),
+    ("monitoring.coreos.com", "prometheusrules"), ("monitoring.coreos.com", "probes"),
+    ("monitoring.coreos.com", "alertmanagerconfigs"),
+    ("monitoring.openshift.io", "alertingrules"),
+    ("monitoring.openshift.io", "alertrelabelconfigs"),
+    ("config.openshift.io", "imagepolicies"),
+}
+
 # Injected into every namespace by the platform.
 GENERATED_CONFIGMAPS = {"kube-root-ca.crt", "openshift-service-ca.crt"}
 
@@ -103,7 +116,8 @@ def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
     """Everything needed to recreate ``namespace``, as plain JSON."""
     ns_obj = c.get(f"/api/v1/namespaces/{namespace}")
     objects: list[dict] = []
-    skipped: list[str] = []
+    skipped: list[str] = []  # app-level kinds that could not be read
+    platform: list[str] = []  # platform kinds the backup account cannot read
     for r in c.resources():
         if not r.namespaced or "list" not in r.verbs or r.group in EXCLUDED_GROUPS:
             continue
@@ -112,6 +126,9 @@ def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
         try:
             items = c.list(r.path(namespace))
         except KubeError as e:
+            if e.status == 403 and (r.group, r.plural) not in APP_LEVEL_RESTRICTED:
+                platform.append(f"{r.plural}.{r.group or 'core'}")
+                continue
             if e.status in (403, 404, 405):
                 skipped.append(f"{r.plural}.{r.group or 'core'}: {e}")
                 continue
@@ -152,6 +169,7 @@ def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
         "pvs": pvs,  # PVC name -> bound PV (as found; used for volume data)
         "storage_classes": classes,
         "skipped_types": skipped,
+        "platform_types": platform,
     }
 
 

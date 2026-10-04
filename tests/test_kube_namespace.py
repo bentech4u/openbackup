@@ -177,3 +177,26 @@ def test_kinds_the_target_lacks_are_skipped(src, tmp_path):
     assert sorted(s.split(":")[0] for s in res.skipped) == ["Route/web", "VirtualMachine/vm1"]
     assert not res.errors
     repo.close()
+
+
+def test_platform_kinds_are_quiet_app_kinds_warn(tmp_path):
+    from fake_kube import RESOURCES
+
+    fk = FakeKube(RESOURCES + [
+        ("metal3.io", "v1alpha1", "baremetalhosts", "BareMetalHost", True),
+        ("monitoring.coreos.com", "v1", "servicemonitors", "ServiceMonitor", True)])
+    seed(fk)
+    fk.denied |= {("list", "baremetalhosts"), ("list", "servicemonitors")}
+    c = KubeClient("https://src:6443", "t", "", transport=fk.transport())
+    cap = capture_namespace(c, "shop")
+    assert cap["platform_types"] == ["baremetalhosts.metal3.io"]
+    assert [s.split(":")[0] for s in cap["skipped_types"]] == [
+        "servicemonitors.monitoring.coreos.com"]
+    repo = Repository.create(tmp_path / "repo", tmp_path / "idx")
+    ctx = NullContext()
+    backup_namespace(c, repo, "shop", NamespaceBackupOptions(1, "h", "u"), ctx)
+    levels = {m.split(":")[0] if "OpenShift platform" not in m else "platform": lvl
+              for lvl, m in ctx.messages if "platform" in m or "servicemonitors" in m}
+    assert levels.get("platform") == "info"
+    assert any(lvl == "warning" and "servicemonitors" in m for lvl, m in ctx.messages)
+    repo.close()

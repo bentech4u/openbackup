@@ -127,16 +127,31 @@ async def oauth_info(body: OAuthInfoIn, _: Principal = Depends(admin)) -> dict:
     """Where password login happens, and the certificates it presents (the
     OAuth server sits on the ingress, usually with a different CA)."""
     def work():
-        validate_ca_bundle(body.ca_pem)
-        with client_factory(body.api_url.rstrip("/"), "", body.ca_pem) as c:
-            url = bootstrap.oauth_endpoint(c)
-        u = urlsplit(url)
-        chain = [] if oauth_transport is not None else fetch_chain(f"https://{u.netloc}")
-        return {"authorize_url": url, "chain": [
-            {"pem": x.pem, "subject": x.subject, "issuer": x.issuer, "sha256": x.sha256,
-             "is_ca": x.is_ca} for x in chain]}
+        return _oauth_info(body.api_url, body.ca_pem)
     try:
         return await run_in_threadpool(work)
+    except KubeError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
+
+
+def _oauth_info(api_url: str, ca_pem: str) -> dict:
+    validate_ca_bundle(ca_pem)
+    with client_factory(api_url.rstrip("/"), "", ca_pem) as c:
+        url = bootstrap.oauth_endpoint(c)
+    u = urlsplit(url)
+    chain = [] if oauth_transport is not None else fetch_chain(f"https://{u.netloc}")
+    return {"authorize_url": url, "chain": [
+        {"pem": x.pem, "subject": x.subject, "issuer": x.issuer, "sha256": x.sha256,
+         "is_ca": x.is_ca} for x in chain]}
+
+
+@router.get("/{cid}/oauth-info")
+async def cluster_oauth_info(cid: int, db: Session = Depends(get_db),
+                             _: Principal = Depends(admin)) -> dict:
+    """OAuth server certificates of a registered cluster, using its pinned API CA."""
+    c = _get(db, cid)
+    try:
+        return await run_in_threadpool(_oauth_info, c.api_url, c.ca_pem)
     except KubeError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
 
@@ -160,14 +175,17 @@ class SetupIn(BaseModel):
 
 
 def _setup(body: SetupIn) -> tuple[bootstrap.SetupResult, dict, dict | None]:
-    api_url = body.api_url.rstrip("/")
-    validate_ca_bundle(body.ca_pem)
-    a = body.admin
+    return _run_setup(body.api_url.rstrip("/"), body.ca_pem, body.admin, body.restore_account)
+
+
+def _run_setup(api_url: str, ca_pem: str, a: AdminAuth, restore_account: bool
+               ) -> tuple[bootstrap.SetupResult, dict, dict | None]:
+    validate_ca_bundle(ca_pem)
     obtained = False
     if a.kind == "password":
         if not a.username or not a.password:
             raise KubeError("Enter the admin username and password")
-        with client_factory(api_url, "", body.ca_pem) as anon:
+        with client_factory(api_url, "", ca_pem) as anon:
             url = bootstrap.oauth_endpoint(anon)
         if oauth_transport is None:
             validate_ca_bundle(a.oauth_ca_pem)
@@ -178,19 +196,51 @@ def _setup(body: SetupIn) -> tuple[bootstrap.SetupResult, dict, dict | None]:
         if not a.token:
             raise KubeError("Paste an admin token")
         admin_token = a.token.strip()
-    with client_factory(api_url, admin_token, body.ca_pem) as admin_client:
+    with client_factory(api_url, admin_token, ca_pem) as admin_client:
         try:
-            result = bootstrap.setup_accounts(admin_client, body.restore_account)
+            result = bootstrap.setup_accounts(admin_client, restore_account)
         finally:
             if obtained:  # only the session we created; a pasted token stays the user's
                 try:
                     bootstrap.revoke_session_token(admin_client, admin_token)
                 except KubeError:
                     pass
-    backup = _probe(api_url, body.ca_pem, result.backup_token)
-    restore = (_probe(api_url, body.ca_pem, result.restore_token, False)
+    backup = _probe(api_url, ca_pem, result.backup_token)
+    restore = (_probe(api_url, ca_pem, result.restore_token, False)
                if result.restore_token else None)
     return result, backup, restore
+
+
+class PermissionsIn(BaseModel):
+    admin: AdminAuth
+    restore_account: bool | None = None  # default: keep what the cluster has
+
+
+@router.post("/{cid}/permissions")
+async def update_permissions(cid: int, body: PermissionsIn, request: Request,
+                             db: Session = Depends(get_db), p: Principal = Depends(admin)) -> dict:
+    """Re-apply OpenBackup's ServiceAccounts and roles on an existing cluster
+    (after an upgrade added permissions), with admin credentials used once."""
+    c = _get(db, cid)
+    with_restore = bool(c.restore_token_enc) if body.restore_account is None \
+        else body.restore_account
+    try:
+        result, backup, restore = await run_in_threadpool(_run_setup, c.api_url, c.ca_pem,
+                                                          body.admin, with_restore)
+    except KubeError as e:
+        audit(db, request, "cluster.permissions", principal=p, target=c.name, success=False,
+              detail={"error": str(e)[:300]})
+        db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
+    c.backup_token_enc = encrypt(result.backup_token)
+    if result.restore_token:
+        c.restore_token_enc = encrypt(result.restore_token)
+    audit(db, request, "cluster.permissions", principal=p, target=c.name,
+          detail={"admin_user": result.admin_user, "login": body.admin.kind,
+                  "applied": result.created})
+    return {"cluster": _out(c).model_dump(mode="json"), "backup": backup, "restore": restore,
+            "admin_user": result.admin_user, "created": result.created,
+            "skipped": result.skipped}
 
 
 @router.post("/setup", status_code=201)
