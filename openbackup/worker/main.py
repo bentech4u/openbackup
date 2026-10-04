@@ -22,7 +22,7 @@ from ..db.models import Job, Task, TaskKind, TaskState
 from ..engine.context import Cancelled
 from ..services import next_run
 from .context import DbTaskContext
-from .tasks import EXECUTORS
+from .tasks import EXECUTORS, scrub_secrets
 
 log = logging.getLogger("openbackup.worker")
 
@@ -61,9 +61,11 @@ def schedule_tick(now: datetime | None = None) -> int:
 
 def recover_interrupted() -> None:
     with session_scope() as db:
-        db.execute(update(Task).where(Task.state == TaskState.running).values(
-            state=TaskState.failed, finished_at=datetime.now(UTC),
-            summary="Interrupted: the worker stopped while this task was running"))
+        for t in db.scalars(select(Task).where(Task.state == TaskState.running)):
+            t.state = TaskState.failed
+            t.finished_at = datetime.now(UTC)
+            t.summary = "Interrupted: the worker stopped while this task was running"
+            scrub_secrets(t)
 
 
 def claim_next(running_repos: set[int | None]) -> int | None:
@@ -75,6 +77,7 @@ def claim_next(running_repos: set[int | None]) -> int | None:
             if t.cancel_requested:
                 t.state = TaskState.cancelled
                 t.finished_at = datetime.now(UTC)
+                scrub_secrets(t)
                 continue
             res = db.execute(update(Task).where(Task.id == t.id,
                                                 Task.state == TaskState.queued)
@@ -105,6 +108,7 @@ def execute(task_id: int) -> None:
         t.state = state
         t.summary = summary
         t.finished_at = datetime.now(UTC)
+        scrub_secrets(t)
         if state in (TaskState.success, TaskState.warning):
             t.progress = 1.0
     ctx.log(f"Finished: {state.value}. {summary}")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from ..db.models import RepoKind, Role, TaskKind, TaskState
 
@@ -71,6 +71,8 @@ class JobOut(ORM):
 
 
 class TaskOut(ORM):
+    """``params`` never includes secrets (guest credentials and the like)."""
+
     id: int
     kind: TaskKind
     state: TaskState
@@ -89,6 +91,11 @@ class TaskOut(ORM):
     cancel_requested: bool
     summary: str
     items: list
+
+    @field_validator("params")
+    @classmethod
+    def _no_secrets(cls, v: dict) -> dict:
+        return {k: val for k, val in (v or {}).items() if not k.endswith("_enc")}
 
 
 class TaskLogOut(ORM):

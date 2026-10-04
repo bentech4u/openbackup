@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowLeft, FolderOpen, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 import { del, get, post, type Placement, type PointDetail, type RestorePoint, type Task, type VCenter } from "../api";
 import { useAuth } from "../auth";
 import { Alert, Badge, Button, Card, Confirm, Empty, Field, Loading, Modal, PageHeader, errorText } from "../components/ui";
@@ -150,6 +150,11 @@ export function PointPage() {
             {can("admin") && (
               <Button onClick={() => setDeleting(true)}>
                 <Trash2 size={15} /> Delete
+              </Button>
+            )}
+            {can("operator") && (
+              <Button onClick={() => nav(`/points/${id}/files`)}>
+                <FolderOpen size={15} /> Browse files
               </Button>
             )}
             {can("operator") && (

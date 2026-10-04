@@ -10,7 +10,8 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 [ "$SRC" = "$APP" ] || { echo "expected the checkout at $APP (found $SRC)" >&2; exit 1; }
 
 echo "==> System packages"
-dnf -y install python3.12 nbdkit nbdkit-vddk-plugin nfs-utils qemu-img openssl
+dnf -y install python3.12 nbdkit nbdkit-vddk-plugin nfs-utils qemu-img openssl \
+    libguestfs libguestfs-xfs libguestfs-winsupport python3-libguestfs xfsprogs
 if ! command -v node >/dev/null; then
     dnf -y module install nodejs:22/common
 fi

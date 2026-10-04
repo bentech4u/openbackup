@@ -11,6 +11,7 @@ import Dashboard from "./pages/Dashboard";
 import Jobs from "./pages/Jobs";
 import Tasks, { TaskDetail } from "./pages/Tasks";
 import Restore, { PointPage } from "./pages/Restore";
+import FileBrowser from "./pages/FileBrowser";
 import VCenters from "./pages/VCenters";
 import Repositories from "./pages/Repositories";
 import Users from "./pages/Users";
@@ -42,6 +43,7 @@ function Gate() {
         <Route path="tasks/:id" element={<TaskDetail />} />
         <Route path="restore" element={<Restore />} />
         <Route path="points/:id" element={<PointPage />} />
+        <Route path="points/:id/files" element={<FileBrowser />} />
         <Route path="vcenters" element={<VCenters />} />
         <Route path="repositories" element={<Repositories />} />
         {can("admin") && <Route path="users" element={<Users />} />}

@@ -9,11 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ... import services
+from ...auth.secrets import encrypt
 from ...db.models import Repository as RepoRow
 from ...db.models import RestorePoint, Role, Task, TaskKind, VCenter
 from ...repo.repository import RepositoryError
 from ..deps import Principal, admin, audit, get_db, operator, viewer
 from ..schemas import RestorePointOut, TaskOut
+from .flr import check_browse_path
 
 router = APIRouter(prefix="/api/points", tags=["restore points"])
 
@@ -118,12 +120,24 @@ class NewVmIn(BaseModel):
     power_on: bool = False
 
 
+class FilesIn(BaseModel):
+    """Restore selected files/folders into a running VM through VMware Tools."""
+
+    items: list[str] = Field(min_length=1, max_length=1000)
+    vm_moref: str = Field(pattern=r"^vm-\d+$")
+    guest_user: str = Field(min_length=1, max_length=255)
+    guest_password: str = Field(min_length=1, max_length=1024)
+    conflict: Literal["overwrite", "rename", "skip"] = "rename"
+    target_dir: str | None = Field(None, max_length=1024)
+
+
 class RestoreIn(BaseModel):
-    mode: Literal["new_vm", "in_place", "export"]
+    mode: Literal["new_vm", "in_place", "export", "files"]
     vcenter_id: int | None = None
     target: NewVmIn | None = None
     format: Literal["raw", "vmdk", "qcow2"] = "raw"
     power_on: bool = False
+    files: FilesIn | None = None
 
 
 @router.post("/{point_id}/restore", response_model=TaskOut, status_code=202)
@@ -134,11 +148,31 @@ def restore(point_id: str, body: RestoreIn, request: Request, db: Session = Depe
     if body.mode == "in_place" and pr.role.rank < Role.admin.rank:
         raise HTTPException(status.HTTP_403_FORBIDDEN,
                             "Overwriting a production VM requires the admin role")
-    if body.mode in ("new_vm", "in_place"):
+    if body.mode == "files":
+        f = body.files
+        if f is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose files and a target VM")
+        if f.conflict == "overwrite" and pr.role.rank < Role.admin.rank:
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                "Overwriting files in a running VM requires the admin role; "
+                                "use rename instead")
+        for item in f.items:
+            check_browse_path(item)
+        if f.target_dir is not None and ("\x00" in f.target_dir or not f.target_dir.strip()):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid target folder")
+    if body.mode in ("new_vm", "in_place", "files"):
         if body.vcenter_id is None or db.get(VCenter, body.vcenter_id) is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose the target vCenter")
         params["vcenter_id"] = body.vcenter_id
-    if body.mode == "new_vm":
+    if body.mode == "files":
+        f = body.files
+        params.update(items=f.items, vm_moref=f.vm_moref, guest_user=f.guest_user,
+                      guest_password_enc=encrypt(f.guest_password), conflict=f.conflict,
+                      target_dir=(f.target_dir or "").strip() or None)
+        n = len(f.items)
+        title = (f"Restore {n} item{'s' if n > 1 else ''} from {p.vm_name} into "
+                 f"{f.vm_moref} ({f.conflict})")
+    elif body.mode == "new_vm":
         if body.target is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Target placement is required")
         params["target"] = body.target.model_dump()
@@ -163,5 +197,6 @@ def restore(point_id: str, body: RestoreIn, request: Request, db: Session = Depe
     db.flush()
     audit(db, request, f"point.restore.{body.mode}", principal=pr,
           target=f"{p.vm_name} {point_id}", detail={k: v for k, v in params.items()
-                                                     if k != "point_id"})
+                                                     if k not in ("point_id",
+                                                                  "guest_password_enc")})
     return t

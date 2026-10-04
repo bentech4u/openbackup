@@ -229,3 +229,76 @@ def test_validation(admin_api, setup):
     r = admin_api.post("/api/vcenters", json={"name": "vc2", "host": "h", "username": "u",
                                               "password": "p", "thumbprint": "nope"})
     assert r.status_code == 400
+
+
+def test_file_restore_into_vm(admin_api, fake, setup, make_user, login, monkeypatch, tmp_path):
+    from test_filerestore import FakeGuest, FakeSession
+
+    from openbackup.db import session_scope
+    from openbackup.db.models import Task
+    from openbackup.vsphere.guestops import GuestInfo
+    from openbackup.worker import tasks
+
+    admin_api.post(f"/api/jobs/{setup['job_id']}/run")
+    run_worker_until_idle()
+    pid = admin_api.get("/api/points").json()[0]["id"]
+
+    backup = tmp_path / "backup"
+    (backup / "etc").mkdir(parents=True)
+    (backup / "etc/app.conf").write_text("good config")
+    guest_root = tmp_path / "guest"
+    (guest_root / "etc").mkdir(parents=True)
+    (guest_root / "etc/app.conf").write_text("broken config")
+    seen = {}
+
+    class Guest(FakeGuest):
+        def check(self):
+            return GuestInfo("linuxGuest", "Test Linux", "web01")
+
+    def guest_factory(source, moref, user, password):
+        seen.update(moref=moref, user=user, password=password)
+        return Guest(guest_root)
+
+    class Session(FakeSession):
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(tasks, "guest_factory", guest_factory)
+    monkeypatch.setattr(tasks, "flr_session_factory", lambda row, point, repo: Session(backup))
+
+    body = {"mode": "files", "vcenter_id": setup["vc_id"],
+            "files": {"items": ["/v0/etc/app.conf"], "vm_moref": setup["vm"].moref,
+                      "guest_user": "root", "guest_password": "guest-secret-pw",
+                      "conflict": "rename"}}
+
+    # Operators may restore beside the original, but not overwrite.
+    make_user("op", "operator")
+    op = login("op")
+    over = {**body, "files": {**body["files"], "conflict": "overwrite"}}
+    assert op.post(f"/api/points/{pid}/restore", json=over).status_code == 403
+    bad = {**body, "files": {**body["files"], "items": ["/v0/../../etc/shadow"]}}
+    assert op.post(f"/api/points/{pid}/restore", json=bad).status_code == 400
+
+    r = op.post(f"/api/points/{pid}/restore", json=body)
+    assert r.status_code == 202, r.text
+    assert "guest-secret-pw" not in r.text and "guest_password" not in r.text
+    tid = r.json()["id"]
+    run_worker_until_idle()
+
+    t = admin_api.get(f"/api/tasks/{tid}").json()
+    assert t["state"] == "success", t
+    assert seen == {"moref": setup["vm"].moref, "user": "root", "password": "guest-secret-pw",
+                    "closed": True}
+    assert (guest_root / "etc/app.conf").read_text() == "broken config"
+    restored = list((guest_root / "etc").glob("app_restored_*.conf"))
+    assert len(restored) == 1 and restored[0].read_text() == "good config"
+
+    # The credentials are gone from the database once the task is over, and
+    # never reached the audit log.
+    from openbackup.db.models import AuditEntry
+
+    with session_scope() as db:
+        assert "guest_password_enc" not in db.get(Task, tid).params
+        entry = db.query(AuditEntry).filter_by(action="point.restore.files").one()
+        assert "guest-secret-pw" not in str(entry.detail)
+        assert "guest_password_enc" not in entry.detail

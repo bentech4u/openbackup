@@ -204,3 +204,11 @@ input[type="checkbox"], input[type="radio"] { width: auto; accent-color: var(--a
 dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 8px 18px; margin: 0; }
 dl.kv dt { color: var(--muted); }
 dl.kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+
+/* ----- file browser ----- */
+.vol { display: flex; align-items: flex-start; gap: 10px; width: 100%; text-align: left; background: none; border: none; border-bottom: 1px solid var(--border); padding: 10px 14px; font: inherit; color: var(--text); cursor: pointer; }
+.vol:last-child { border-bottom: none; }
+.vol:hover:not(:disabled) { background: var(--surface-2); }
+.vol.on { background: var(--accent-soft); }
+.vol:disabled { cursor: not-allowed; opacity: 0.6; }
+.crumbs a { cursor: pointer; }

@@ -42,3 +42,7 @@ ignore = ["B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Runs under the system Python 3.9 (RHEL's libguestfs bindings), not ours.
+"openbackup/flr/guestfs_helper.py" = ["UP", "B905"]

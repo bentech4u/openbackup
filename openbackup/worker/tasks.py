@@ -18,8 +18,29 @@ from ..repo.maintenance import collect_garbage, select_expired, verify_point
 from ..repo.repository import Repository
 from .context import DbTaskContext, ScopedContext
 
-# Tests replace this to run against a fake vSphere.
+# Tests replace these to run against fakes.
 source_factory = services.vsphere_source
+
+
+def guest_factory(source, vm_moref: str, username: str, password: str):
+    from ..vsphere.guestops import GuestFiles
+
+    return GuestFiles(source, vm_moref, username, password)
+
+
+def flr_session_factory(repo_row, point_id: str, repo):
+    from ..flr.session import FlrSession
+
+    return FlrSession(repo_row, point_id, repo=repo).open()
+
+
+SECRET_PARAMS = ("guest_password_enc",)
+
+
+def scrub_secrets(task: Task) -> None:
+    """Drop one-time credentials from a task once it can no longer run."""
+    if any(k in (task.params or {}) for k in SECRET_PARAMS):
+        task.params = {k: v for k, v in task.params.items() if k not in SECRET_PARAMS}
 
 
 def _load(task_id: int) -> tuple[Task, Job | None, RepoRow | None, VCenter | None]:
@@ -162,6 +183,8 @@ def run_restore(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
     if repo_row is None:
         return TaskState.failed, "Repository no longer exists"
     with services.open_repository(repo_row) as repo:
+        if p["mode"] == "files":
+            return _restore_files(task_id, p, repo_row, repo, vc, ctx)
         if p["mode"] == "export":
             dest = Path(p["path"])
             files = export_disks(repo, p["point_id"], dest, p.get("format", "raw"), ctx)
@@ -186,6 +209,47 @@ def run_restore(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
         finally:
             source.close()
     return TaskState.failed, f"Unknown restore mode {p['mode']}"
+
+
+def _restore_files(task_id, p, repo_row, repo, vc, ctx) -> tuple[TaskState, str]:
+    from ..auth.secrets import decrypt
+    from ..config import get_settings
+    from ..engine.filerestore import restore_files
+
+    if vc is None:
+        return TaskState.failed, "vCenter no longer exists"
+    if not p.get("guest_password_enc"):
+        return TaskState.failed, "Guest credentials are no longer available; start again"
+    manifest = repo.load_manifest(p["point_id"])
+    stamp = datetime.fromisoformat(manifest["created_at"]).strftime("%Y%m%d-%H%M")
+    source = source_factory(vc)
+    source.connect()
+    try:
+        guest = guest_factory(source, p["vm_moref"], p["guest_user"],
+                              decrypt(p["guest_password_enc"]))
+        info = guest.check()
+        ctx.log(f"Guest {info.hostname or p['vm_moref']} ({info.os_name}): VMware Tools ready, "
+                "credentials accepted")
+        ctx.log("Opening the restore point (this starts a small helper VM and can take a "
+                "minute)")
+        session = flr_session_factory(repo_row, p["point_id"], repo)
+        try:
+            res = restore_files(session, guest, p["items"], p["conflict"], p.get("target_dir"),
+                                stamp, get_settings().data_dir / "flr-staging" / str(task_id),
+                                ctx)
+        finally:
+            session.close()
+    finally:
+        source.close()
+    summary = f"{res.files} file(s) restored ({res.bytes / 2**20:.1f} MiB)"
+    if res.renamed:
+        summary += f", {len(res.renamed)} restored under a new name"
+    if res.skipped:
+        summary += f", {res.skipped} skipped"
+    if res.errors:
+        summary += f", {len(res.errors)} failed"
+        return (TaskState.failed if not res.files else TaskState.warning), summary
+    return (TaskState.warning if res.skipped else TaskState.success), summary
 
 
 # --------------------------------------------------------------- maintenance
