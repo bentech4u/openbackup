@@ -16,6 +16,7 @@ from .routers import (
     flr,
     inventory,
     jobs,
+    mover,
     points,
     repositories,
     tasks,
@@ -55,7 +56,7 @@ def create_app(*, create_tables: bool = True) -> FastAPI:
         return response
 
     for r in (auth, users, audit, vcenters, inventory, datastores, clusters, repositories, jobs,
-              tasks, points, flr, dashboard):
+              tasks, points, flr, mover, dashboard):
         app.include_router(r.router)
 
     @app.get("/api/health", include_in_schema=False)

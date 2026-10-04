@@ -174,6 +174,8 @@ class KubeCluster(Base):
         ForeignKey("vcenters.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
+    vcenter: Mapped[VCenter | None] = relationship()
+
 
 class JobKind(enum.StrEnum):
     vsphere = "vsphere"

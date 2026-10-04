@@ -104,6 +104,16 @@ class KubeClient:
     def get(self, path: str, **params) -> Any:
         return self._request("GET", path, params=params or None)
 
+    def get_text(self, path: str, **params) -> str:
+        """A plain-text endpoint, such as pod logs."""
+        try:
+            r = self._http.get(path, params=params or None)
+        except httpx.HTTPError as e:
+            raise KubeError(f"Request to {self.api_url} failed: {e}") from None
+        if r.status_code >= 400:
+            raise KubeError(r.text[:300], r.status_code)
+        return r.text
+
     def list(self, path: str, label_selector: str | None = None) -> list[dict]:
         """All items of a collection, following pagination."""
         items: list[dict] = []

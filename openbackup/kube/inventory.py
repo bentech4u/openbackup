@@ -88,3 +88,15 @@ def permissions(c: KubeClient) -> dict:
         out["freeze_vms"] = c.can("update", "virtualmachineinstances", "subresources.kubevirt.io",
                                   subresource="freeze")
     return out
+
+
+def vsphere_servers(c: KubeClient) -> list[str]:
+    """The vCenter(s) an OpenShift-on-vSphere cluster was installed against,
+    from its Infrastructure object (readable with cluster-reader)."""
+    try:
+        infra = c.get("/apis/config.openshift.io/v1/infrastructures/cluster")
+    except KubeError:
+        return []
+    spec = (infra.get("spec") or {}).get("platformSpec") or {}
+    servers = [v.get("server") for v in (spec.get("vsphere") or {}).get("vcenters") or []]
+    return [s for s in servers if s]

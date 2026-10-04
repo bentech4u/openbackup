@@ -96,3 +96,35 @@ def test_bad_ca_and_roles(admin_api, cluster, ca_pem, make_user, login):
     r = op.post("/api/clusters", json={"name": "x", "api_url": "https://a:6443",
                                        "ca_pem": ca_pem, "backup_token": "t"})
     assert r.status_code == 403
+
+
+def test_vcenter_is_detected_and_can_be_changed(admin_api, cluster, ca_pem, monkeypatch):
+    from openbackup.api.routers import vcenters
+
+    class VC:
+        def about(self):
+            return {"version": "8.0.3"}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(vcenters, "connector", lambda *a: VC())
+    thumb = ":".join(["AB"] * 20)
+    for name, host in (("lab", "192.168.68.114"), ("other", "vc2.example")):
+        assert admin_api.post("/api/vcenters", json={
+            "name": name, "host": host, "username": "u", "password": "p",
+            "thumbprint": thumb}).status_code == 201
+    cluster.add({"apiVersion": "config.openshift.io/v1", "kind": "Infrastructure",
+                 "metadata": {"name": "cluster"},
+                 "spec": {"platformSpec": {"type": "VSphere", "vsphere": {
+                     "vcenters": [{"server": "192.168.68.114", "datacenters": ["DC1"]}]}}}})
+    out = _add(admin_api, ca_pem).json()["cluster"]
+    assert out["vcenter_name"] == "lab"  # linked without being asked
+    info = admin_api.get(f"/api/clusters/{out['id']}/vsphere").json()
+    assert info["reported"] == ["192.168.68.114"]
+    assert info["suggested_vcenter_id"] == info["linked_vcenter_id"]
+    other = next(v["id"] for v in admin_api.get("/api/vcenters").json() if v["name"] == "other")
+    r = admin_api.patch(f"/api/clusters/{out['id']}", json={"vcenter_id": other})
+    assert r.status_code == 200 and r.json()["vcenter_name"] == "other"
+    r = admin_api.patch(f"/api/clusters/{out['id']}", json={"vcenter_id": None})
+    assert r.json()["vcenter_id"] is None

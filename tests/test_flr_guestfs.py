@@ -100,3 +100,17 @@ def test_backup_is_never_modified(session):
         s._call("download", {"path": f"/{_vol(s, 'ext4')['id']}/home", "dest": "/tmp/x"})
     assert shutil.which("true")  # session still alive afterwards
     assert s.ls(f"/{_vol(s, 'ext4')['id']}/etc")
+
+
+def test_tar_out_streams_a_tree(session):
+    import tarfile
+
+    s, tmp = session
+    data = _vol(s, "xfs")["id"]
+    out = tmp / "tree.tar"
+    s.tar_out(f"/{data}/sub", out)
+    with tarfile.open(out) as t:
+        names = {n.lstrip("./") for n in t.getnames()}
+        assert "deeper/leaf.txt" in names
+        assert t.extractfile([m for m in t.getmembers()
+                              if m.name.endswith("leaf.txt")][0]).read() == b"leaf\n"

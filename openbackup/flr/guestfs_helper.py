@@ -154,8 +154,18 @@ def cmd_walk(path, limit=200000):
     return out
 
 
+def cmd_tar_out(path, dest):
+    """Write a tar of ``path`` (numeric owners kept) to ``dest``, which may
+    be a FIFO another process is reading."""
+    path = _check_path(path)
+    # lost+found belongs to the target filesystem (root-owned, recreated by
+    # mkfs); a non-root restore could not write it anyway.
+    g.tar_out(path, dest, numericowner=True, excludes=["./lost+found"])
+    return {"ok": True}
+
+
 COMMANDS = {"open": cmd_open, "ls": cmd_ls, "stat": cmd_stat, "download": cmd_download,
-            "walk": cmd_walk}
+            "walk": cmd_walk, "tar_out": cmd_tar_out}
 
 
 def main():

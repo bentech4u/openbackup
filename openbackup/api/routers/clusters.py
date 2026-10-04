@@ -34,6 +34,7 @@ class ClusterOut(BaseModel):
     name: str
     api_url: str
     vcenter_id: int | None
+    vcenter_name: str | None = None
     has_restore_token: bool = False
     ca_subjects: list[str] = []
     created_at: datetime
@@ -41,6 +42,7 @@ class ClusterOut(BaseModel):
 
 def _out(c: KubeCluster) -> ClusterOut:
     o = ClusterOut.model_validate(c)
+    o.vcenter_name = c.vcenter.name if c.vcenter_id and c.vcenter else None
     o.has_restore_token = bool(c.restore_token_enc)
     try:
         o.ca_subjects = [x.subject for x in validate_ca_bundle(c.ca_pem)]
@@ -69,6 +71,19 @@ class ClusterUpdate(BaseModel):
     restore_token: str | None = Field(None, max_length=16384)
     clear_restore_token: bool = False
     vcenter_id: int | None = None
+
+
+def _detect_vcenter(db: Session, api_url: str, ca_pem: str, token: str) -> VCenter | None:
+    """The registered vCenter this cluster runs on, if any."""
+    try:
+        with client_factory(api_url, token, ca_pem) as c:
+            servers = {s.lower() for s in inventory.vsphere_servers(c)}
+    except KubeError:
+        return None
+    for vc in db.scalars(select(VCenter)):
+        if vc.host.lower() in servers:
+            return vc
+    return None
 
 
 def _probe(api_url: str, ca_pem: str, token: str, need_read: bool = True) -> dict:
@@ -194,12 +209,18 @@ async def setup(body: SetupIn, request: Request, db: Session = Depends(get_db),
               detail={"api_url": body.api_url, "error": str(e)[:300]})
         db.commit()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
+    vcenter_id = body.vcenter_id
+    if vcenter_id is None:
+        vc = await run_in_threadpool(_detect_vcenter, db, body.api_url.rstrip("/"),
+                                     body.ca_pem, result.backup_token)
+        vcenter_id = vc.id if vc else None
     c = KubeCluster(name=body.name, api_url=body.api_url.rstrip("/"), ca_pem=body.ca_pem,
                     backup_token_enc=encrypt(result.backup_token),
                     restore_token_enc=encrypt(result.restore_token) if result.restore_token
-                    else None, vcenter_id=body.vcenter_id)
+                    else None, vcenter_id=vcenter_id)
     db.add(c)
     db.flush()
+    db.refresh(c)
     audit(db, request, "cluster.setup", principal=p, target=c.name,
           detail={"api_url": c.api_url, "admin_user": result.admin_user,
                   "login": body.admin.kind, "created": result.created})
@@ -226,12 +247,18 @@ async def add_cluster(body: ClusterIn, request: Request, db: Session = Depends(g
     if body.restore_token:
         restore_info = await run_in_threadpool(_probe, body.api_url.rstrip("/"), body.ca_pem,
                                                body.restore_token, False)
+    vcenter_id = body.vcenter_id
+    if vcenter_id is None:
+        vc = await run_in_threadpool(_detect_vcenter, db, body.api_url.rstrip("/"),
+                                     body.ca_pem, body.backup_token)
+        vcenter_id = vc.id if vc else None
     c = KubeCluster(name=body.name, api_url=body.api_url.rstrip("/"), ca_pem=body.ca_pem,
                     backup_token_enc=encrypt(body.backup_token),
                     restore_token_enc=encrypt(body.restore_token) if body.restore_token
-                    else None, vcenter_id=body.vcenter_id)
+                    else None, vcenter_id=vcenter_id)
     db.add(c)
     db.flush()
+    db.refresh(c)
     audit(db, request, "cluster.create", principal=p, target=c.name,
           detail={"api_url": c.api_url, "user": info["user"], "version": info["version"]})
     return {"cluster": _out(c).model_dump(mode="json"), "backup": info, "restore": restore_info}
@@ -298,6 +325,26 @@ async def list_namespaces(cid: int, include_system: bool = False, db: Session = 
     c = _get(db, cid)
     db.expunge(c)
     return await run_in_threadpool(_namespaces, c, include_system)
+
+
+@router.get("/{cid}/vsphere")
+async def vsphere_info(cid: int, db: Session = Depends(get_db),
+                       _: Principal = Depends(viewer)) -> dict:
+    """The vCenter the cluster reports running on, and whether it is linked."""
+    c = _get(db, cid)
+    db.expunge(c)
+
+    def work():
+        with cluster_client(c) as k:
+            return inventory.vsphere_servers(k)
+    try:
+        servers = await run_in_threadpool(work)
+    except KubeError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e)) from None
+    match = next((vc for vc in db.scalars(select(VCenter))
+                  if vc.host.lower() in {s.lower() for s in servers}), None)
+    return {"reported": servers, "suggested_vcenter_id": match.id if match else None,
+            "linked_vcenter_id": c.vcenter_id}
 
 
 @router.get("/{cid}/check")

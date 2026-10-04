@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Plus, XCircle } from "lucide-react";
-import { del, get, post, type VCenter } from "../api";
+import { del, get, patch, post, type VCenter } from "../api";
 import { useAuth } from "../auth";
 import { Alert, Badge, Button, Card, Confirm, Empty, Field, Loading, Modal, PageHeader, errorText } from "../components/ui";
 import { bytes } from "../format";
@@ -11,6 +11,7 @@ export interface Cluster {
   name: string;
   api_url: string;
   vcenter_id: number | null;
+  vcenter_name: string | null;
   has_restore_token: boolean;
   ca_subjects: string[];
   created_at: string;
@@ -103,6 +104,7 @@ export default function Clusters() {
                   <th>Name</th>
                   <th>API</th>
                   <th>Trusted CA</th>
+                  <th>Volume data via</th>
                   <th>Restore credential</th>
                   <th />
                 </tr>
@@ -115,6 +117,7 @@ export default function Clusters() {
                     </td>
                     <td className="mono small">{c.api_url}</td>
                     <td className="small">{c.ca_subjects.join(", ")}</td>
+                    <td>{c.vcenter_name ? <Badge tone="good">{c.vcenter_name}</Badge> : <Badge tone="warn">not linked</Badge>}</td>
                     <td>{c.has_restore_token ? <Badge tone="info">stored</Badge> : <Badge>asked per restore</Badge>}</td>
                     <td className="right">
                       {can("admin") && (
@@ -130,6 +133,9 @@ export default function Clusters() {
           </div>
         )}
       </Card>
+      {current && clusters.data && (
+        <VolumeData cluster={clusters.data.find((c) => c.id === current)!} onChanged={() => qc.invalidateQueries({ queryKey: ["clusters"] })} />
+      )}
       {current && <Namespaces clusterId={current} />}
       {adding && (
         <AddCluster
@@ -237,7 +243,6 @@ interface ChainCert {
 }
 
 function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const vcs = useQuery({ queryKey: ["vcenters"], queryFn: () => get<VCenter[]>("/api/vcenters") });
   const [name, setName] = useState("");
   const [url, setUrl] = useState("https://api.");
   const [chain, setChain] = useState<ChainCert[] | null>(null);
@@ -245,7 +250,6 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
   const [pasteCa, setPasteCa] = useState(false);
   const [backupToken, setBackupToken] = useState("");
   const [restoreToken, setRestoreToken] = useState("");
-  const [vcenterId, setVcenterId] = useState<number | "">("");
   const [mode, setMode] = useState<"setup" | "tokens">("setup");
   const [adminKind, setAdminKind] = useState<"password" | "token">("password");
   const [username, setUsername] = useState("kubeadmin");
@@ -306,7 +310,6 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
         ca_pem: caPem,
         backup_token: backupToken.trim(),
         restore_token: restoreToken.trim() || null,
-        vcenter_id: vcenterId === "" ? null : vcenterId,
       });
       setResult(r);
       onDone();
@@ -325,7 +328,6 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
         name: name.trim(),
         api_url: url.trim(),
         ca_pem: caPem,
-        vcenter_id: vcenterId === "" ? null : vcenterId,
         restore_account: restoreAccount,
         admin:
           adminKind === "password"
@@ -515,12 +517,98 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
         </Field>
           </>
         )}
-        <Field label="vCenter for persistent volume data" hint="The vCenter whose vSphere CSI volumes this cluster uses">
-          <select value={vcenterId} onChange={(e) => setVcenterId(e.target.value ? Number(e.target.value) : "")}>
-            <option value="">None (resources only)</option>
+      </div>
+    </Modal>
+  );
+}
+
+
+function VolumeData({ cluster, onChanged }: { cluster: Cluster; onChanged: () => void }) {
+  const { can } = useAuth();
+  const [editing, setEditing] = useState(false);
+  return (
+    <Card
+      title="Persistent volume data"
+      actions={can("admin") && <Button onClick={() => setEditing(true)}>{cluster.vcenter_name ? "Change" : "Link vCenter"}</Button>}
+    >
+      {cluster.vcenter_name ? (
+        <div>
+          Volumes on vSphere CSI are backed up through vCenter <strong>{cluster.vcenter_name}</strong> (snapshots only; the data is read
+          from the datastore directly). Configure direct NFS for their datastore on the vCenters page.
+        </div>
+      ) : (
+        <Alert tone="warn">
+          No vCenter is linked, so only volume claims are backed up, not their data. Link the vCenter this cluster runs on.
+        </Alert>
+      )}
+      {editing && (
+        <LinkVCenter
+          cluster={cluster}
+          onClose={() => setEditing(false)}
+          onDone={() => {
+            setEditing(false);
+            onChanged();
+          }}
+        />
+      )}
+    </Card>
+  );
+}
+
+function LinkVCenter({ cluster, onClose, onDone }: { cluster: Cluster; onClose: () => void; onDone: () => void }) {
+  const vcs = useQuery({ queryKey: ["vcenters"], queryFn: () => get<VCenter[]>("/api/vcenters") });
+  const info = useQuery({
+    queryKey: ["cluster-vsphere", cluster.id],
+    queryFn: () => get<{ reported: string[]; suggested_vcenter_id: number | null }>(`/api/clusters/${cluster.id}/vsphere`),
+  });
+  const [choice, setChoice] = useState<number | "" | undefined>(undefined);
+  const value = choice ?? cluster.vcenter_id ?? info.data?.suggested_vcenter_id ?? "";
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    setBusy(true);
+    setError("");
+    try {
+      await patch(`/api/clusters/${cluster.id}`, { vcenter_id: value === "" ? null : value });
+      onDone();
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      title={`vCenter for ${cluster.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant="primary" onClick={save} busy={busy}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <div className="stack">
+        <Alert>{error}</Alert>
+        {info.isLoading ? (
+          <Loading />
+        ) : info.data?.reported.length ? (
+          <div className="muted small">
+            The cluster reports running on <code>{info.data.reported.join(", ")}</code>
+            {info.data.suggested_vcenter_id ? "; that vCenter is preselected." : "; add that vCenter on the vCenters page if it is missing."}
+          </div>
+        ) : (
+          <div className="muted small">The cluster does not report a vCenter (not installed on vSphere, or no access).</div>
+        )}
+        <Field label="vCenter">
+          <select value={value} onChange={(e) => setChoice(e.target.value ? Number(e.target.value) : "")}>
+            <option value="">None (back up volume claims only)</option>
             {vcs.data?.map((v) => (
               <option key={v.id} value={v.id}>
-                {v.name}
+                {v.name} ({v.host})
               </option>
             ))}
           </select>
@@ -529,4 +617,3 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
     </Modal>
   );
 }
-

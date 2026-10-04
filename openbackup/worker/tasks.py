@@ -320,6 +320,75 @@ def run_restore(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
     return TaskState.failed, f"Unknown restore mode {p['mode']}"
 
 
+class VolumeRestore:
+    """Fills each restored volume claim with its backed-up data, through a
+    mover pod in the target namespace (see kube/mover.py)."""
+
+    def __init__(self, kube, repo, point_id: str, namespace: str, ctx):
+        self.kube, self.repo, self.point_id, self.ns, self.ctx = (kube, repo, point_id,
+                                                                  namespace, ctx)
+        self.manifest = repo.load_manifest(point_id)
+        self.session = None
+
+    def _image(self) -> str:
+        from ..config import get_settings
+        from ..kube.mover import resolve_image
+
+        return resolve_image(self.kube, get_settings().mover_image)
+
+    def _producer(self, pvc: str, block: bool, key: str):
+        from ..kube.mover import write_raw
+
+        if block:
+            m = self.repo.load_map(self.point_id, key)
+            chunks = (self.repo.read_chunk(c, m.block_length(i)) for i, c in enumerate(m.ids))
+            return lambda fifo: write_raw(fifo, chunks)
+        if self.session is None:
+            self.ctx.log("Opening the backed-up volumes (starts a small helper VM)")
+            self.session = flr_session_factory(None, self.point_id, self.repo)
+        vol = next((v for v in self.session.volumes
+                    if v.get("disk") == pvc and v["mounted"]), None)
+        if vol is None:
+            raise RuntimeError(f"no readable filesystem found on the backup of {pvc}")
+        return lambda fifo: self.session.tar_out(f"/{vol['id']}", fifo)
+
+    def __call__(self, pvcs: list[dict]) -> list[str]:
+        from ..config import get_settings
+        from ..kube.mover import MoverError, run_mover
+
+        settings = get_settings()
+        disks = {d["pvc"]: d for d in self.manifest.get("disks", []) if d.get("pvc")}
+        wanted = [o for o in pvcs if o["metadata"]["name"] in disks]
+        if not wanted:
+            return []
+        try:
+            image = self._image()
+            ca_pem = settings.tls_cert_file.read_text()
+        except (MoverError, OSError) as e:
+            return [f"volume data not restored: {e}"]
+        errors = []
+        for o in wanted:
+            pvc = o["metadata"]["name"]
+            block = (o.get("spec") or {}).get("volumeMode") == "Block"
+            self.ctx.log(f"Restoring data of volume {pvc} ({'raw block' if block else 'files'})")
+            self.ctx.item(pvc, kind="volume", state="running")
+            try:
+                produce = self._producer(pvc, block, disks[pvc]["key"])
+                run_mover(self.kube, self.ns, pvc, block, image, settings.mover_url, ca_pem,
+                          settings.data_dir, produce, self.ctx)
+                self.ctx.item(pvc, state="success")
+                self.ctx.log(f"Volume {pvc} restored")
+            except Exception as e:
+                errors.append(f"volume {pvc}: {e}")
+                self.ctx.item(pvc, state="failed", error=str(e))
+                self.ctx.log(f"Volume {pvc} could not be restored: {e}", "error")
+        return errors
+
+    def close(self) -> None:
+        if self.session is not None:
+            self.session.close()
+
+
 def _restore_namespace(p, repo, ctx) -> tuple[TaskState, str]:
     from ..auth.secrets import decrypt
     from ..kube.engine import NamespaceRestoreOptions, restore_namespace
@@ -339,10 +408,12 @@ def _restore_namespace(p, repo, ctx) -> tuple[TaskState, str]:
         route_host_map=o.get("route_host_map", {}), keep_uid_range=o.get("keep_uid_range", True),
         merge=o.get("merge", False), include_data=o.get("include_data", True))
     kube = kube_client_factory(cluster.api_url, decrypt(token_enc), cluster.ca_pem)
+    vr = VolumeRestore(kube, repo, p["point_id"], opts.target_namespace, ctx)
     try:
         ctx.log(f"Restoring into {cluster.name}/{opts.target_namespace}")
-        res = restore_namespace(kube, repo, p["point_id"], opts, ctx)
+        res = restore_namespace(kube, repo, p["point_id"], opts, ctx, volume_restore=vr)
     finally:
+        vr.close()
         kube.close()
     summary = f"{res.applied} object(s) restored into {cluster.name}/{opts.target_namespace}"
     if res.skipped:

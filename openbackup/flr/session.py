@@ -158,6 +158,9 @@ class FlrSession:
     def download(self, path: str, dest: Path) -> dict:
         return self._call("download", {"path": path, "dest": str(dest)}, timeout=6 * 3600)
 
+    def tar_out(self, path: str, dest: Path) -> None:
+        self._call("tar_out", {"path": path, "dest": str(dest)}, timeout=24 * 3600)
+
     def volume_of(self, path: str) -> dict:
         vid = path.split("/")[1] if path.startswith("/") else ""
         for v in self.volumes:

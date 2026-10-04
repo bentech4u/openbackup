@@ -382,3 +382,131 @@ def test_openshift_namespace_backup_and_restore(admin_api, setup, make_user, log
     assert r.status_code == 202 and "pasted-token" not in r.text
     run_worker_until_idle()
     assert src.get_obj("apps", "deployments", "shop2", "web")
+
+
+def test_namespace_restore_fills_volumes_through_mover_pods(admin_api, setup, client,
+                                                            monkeypatch, tmp_path):
+    """Back up a namespace with a Filesystem and a Block volume, restore it
+    into a DR cluster: simulated mover pods fetch the data from the real
+    /api/mover endpoint with their single-use tokens."""
+    import io
+    import subprocess
+    import tarfile
+    import threading
+
+    from fake_fcd import FakeFcd
+    from fake_kube import FakeKube
+    from test_kube_volumes import seed as seed_volumes
+
+    from openbackup.api.routers import clusters
+    from openbackup.config import get_settings
+    from openbackup.kube.client import KubeClient
+    from openbackup.worker import tasks
+
+    cert = tmp_path / "tls.crt"
+    cert.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+    monkeypatch.setenv("OPENBACKUP_PUBLIC_URL", "http://testserver")
+    monkeypatch.setenv("OPENBACKUP_TLS_CERT_FILE", str(cert))
+    monkeypatch.setenv("OPENBACKUP_MOVER_IMAGE", "registry/tools:latest")
+    get_settings.cache_clear()
+    monkeypatch.setattr("openbackup.kube.mover.time.sleep", lambda s: None)
+
+    fcd = FakeFcd(tmp_path / "ds")
+    fs_vol, blk_vol = fcd.add(4 << 20), fcd.add(2 << 20)
+    blk_data = os.urandom(2 << 20)
+    fcd.write(blk_vol, 0, blk_data)
+    src, dr = FakeKube(), FakeKube()
+    seed_volumes(src, {"data": ("csi.vsphere.vmware.com", fs_vol),
+                       "disk": ("csi.vsphere.vmware.com", blk_vol)})
+    pvc = src.get_obj("", "persistentvolumeclaims", "db", "disk")
+    pvc["spec"]["volumeMode"] = "Block"
+
+    received: dict[str, bytes] = {}
+    mover_client = client  # the API under test, as the pods would reach it
+
+    def run_pod(pod: dict) -> None:
+        env = {e["name"]: e["value"] for e in pod["spec"]["containers"][0]["env"]}
+        claim = pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"]
+        path = env["OB_URL"].removeprefix("http://testserver")
+        r = mover_client.get(path, headers={"Authorization": f"Bearer {env['OB_TOKEN']}"})
+        received[claim] = r.content if r.status_code == 200 else b"HTTP %d" % r.status_code
+        # A second fetch with the same token must fail.
+        again = mover_client.get(path, headers={"Authorization": f"Bearer {env['OB_TOKEN']}"})
+        received[claim + ":replay"] = str(again.status_code).encode()
+        stored = dr.get_obj("", "pods", pod["metadata"]["namespace"], pod["metadata"]["name"])
+        stored["status"] = {"phase": "Succeeded" if r.status_code == 200 else "Failed"}
+
+    def on_create(obj):
+        if obj["kind"] == "Pod":
+            threading.Thread(target=run_pod, args=(obj,), daemon=True).start()
+
+    dr.on_create.append(on_create)
+    by_url = {"https://api.homelab.example:6443": src, "https://api.dr.example:6443": dr}
+
+    def factory(url, token, ca, **kw):
+        return KubeClient(url, token, ca, transport=by_url[url].transport())
+
+    class Source:
+        def connect(self):
+            return self
+
+        def close(self):
+            pass
+
+        _flat_disk = staticmethod(fcd.open_flat)
+
+    class FsSession:
+        volumes = [{"id": "v0", "disk": "data", "mounted": True}]
+
+        def tar_out(self, path, fifo):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as t:
+                info = tarfile.TarInfo("hello.txt")
+                info.size = 5
+                t.addfile(info, io.BytesIO(b"hello"))
+            with open(fifo, "wb") as f:
+                f.write(buf.getvalue())
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(clusters, "client_factory", factory)
+    monkeypatch.setattr(tasks, "kube_client_factory", factory)
+    monkeypatch.setattr(tasks, "source_factory", lambda vc: Source())
+    monkeypatch.setattr(tasks, "fcd_factory", lambda source: fcd)
+    monkeypatch.setattr(tasks, "flr_session_factory", lambda row, point, repo: FsSession())
+
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-keyout", str(tmp_path / "k"), "-out", str(tmp_path / "c"),
+                    "-subj", "/CN=ca", "-addext", "basicConstraints=critical,CA:TRUE"],
+                   check=True, capture_output=True)
+    ca = (tmp_path / "c").read_text()
+    home = admin_api.post("/api/clusters", json={
+        "name": "homelab", "api_url": "https://api.homelab.example:6443", "ca_pem": ca,
+        "backup_token": "b", "vcenter_id": setup["vc_id"]}).json()["cluster"]["id"]
+    drc = admin_api.post("/api/clusters", json={
+        "name": "dr", "api_url": "https://api.dr.example:6443", "ca_pem": ca,
+        "backup_token": "b", "restore_token": "r"}).json()["cluster"]["id"]
+    job = admin_api.post("/api/jobs", json={
+        "name": "ocp-db", "kind": "openshift", "cluster_id": home,
+        "repository_id": setup["repo_id"], "selection": {"namespaces": ["db"]}}).json()
+    tid = admin_api.post(f"/api/jobs/{job['id']}/run").json()["id"]
+    run_worker_until_idle()
+    assert admin_api.get(f"/api/tasks/{tid}").json()["state"] in ("success", "warning")
+    point = next(p for p in admin_api.get("/api/points").json()
+                 if p["subject_kind"] == "namespace")
+    detail = admin_api.get(f"/api/points/{point['id']}").json()
+    assert {p["name"]: p["data"] for p in detail["pvcs"]} == {"data": True, "disk": True}
+
+    r = admin_api.post(f"/api/points/{point['id']}/restore", json={
+        "mode": "namespace", "namespace": {"cluster_id": drc, "target_namespace": "db"}})
+    run_worker_until_idle()
+    t = admin_api.get(f"/api/tasks/{r.json()['id']}").json()
+    assert t["state"] in ("success", "warning"), t
+    assert received["disk"] == blk_data
+    with tarfile.open(fileobj=io.BytesIO(received["data"])) as tf:
+        assert tf.extractfile("hello.txt").read() == b"hello"
+    assert received["data:replay"] == b"404" and received["disk:replay"] == b"404"
+    pods = [k for k in dr.objects if k[1] == "pods"]
+    assert pods == []  # mover pods are cleaned up
+    get_settings.cache_clear()

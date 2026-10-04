@@ -41,9 +41,22 @@ class Settings(BaseSettings):
     login_max_failures: int = 5
     login_lockout_minutes: int = 15
 
+    # How restore "mover" pods inside OpenShift reach this server, and the
+    # certificate they pin for it. Default: https://<this host's FQDN>:8443.
+    public_url: str | None = None
+    tls_cert_file: Path = Path("/etc/openbackup/tls.crt")
+    # Image for mover pods; default is the cluster's own openshift/tools.
+    mover_image: str | None = None
+
     # Worker.
     worker_poll_seconds: float = 2.0
     worker_concurrency: int = 2
+
+    @property
+    def mover_url(self) -> str:
+        import socket
+
+        return (self.public_url or f"https://{socket.getfqdn()}:8443").rstrip("/")
 
     @property
     def db_url(self) -> str:

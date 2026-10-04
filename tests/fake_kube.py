@@ -39,6 +39,7 @@ RESOURCES = [
     ("rbac.authorization.k8s.io", "v1", "clusterroles", "ClusterRole", False),
     ("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "ClusterRoleBinding", False),
     ("oauth.openshift.io", "v1", "oauthaccesstokens", "OAuthAccessToken", False),
+    ("config.openshift.io", "v1", "infrastructures", "Infrastructure", False),
     ("kubevirt.io", "v1", "virtualmachines", "VirtualMachine", True),
     ("kubevirt.io", "v1", "virtualmachineinstances", "VirtualMachineInstance", True),
 ]
