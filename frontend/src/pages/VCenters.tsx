@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, RefreshCw } from "lucide-react";
-import { del, get, patch, post, type VCenter, type VmSummary } from "../api";
+import { del, get, patch, post, put, type Datastore, type VCenter, type VmSummary } from "../api";
 import { useAuth } from "../auth";
 import { Alert, Badge, Button, Card, Confirm, Empty, Field, Loading, Modal, PageHeader, errorText } from "../components/ui";
 import { bytes } from "../format";
@@ -76,6 +76,7 @@ export default function VCenters() {
           </div>
         )}
       </Card>
+      {current && <Datastores vcId={current} />}
       {current && <Inventory vcId={current} />}
       {adding && (
         <AddVCenter
@@ -339,6 +340,174 @@ function EditVCenter({ vc, onClose, onDone }: { vc: VCenter; onClose: () => void
         <Field label="Certificate SHA-1 thumbprint" hint="Change only after the vCenter certificate was replaced and you verified the new one">
           <input className="mono" value={thumbprint} onChange={(e) => setThumbprint(e.target.value)} />
         </Field>
+      </div>
+    </Modal>
+  );
+}
+
+function Datastores({ vcId }: { vcId: number }) {
+  const { can } = useAuth();
+  const qc = useQueryClient();
+  const ds = useQuery({ queryKey: ["datastores", vcId], queryFn: () => get<Datastore[]>(`/api/vcenters/${vcId}/datastores`) });
+  const [editing, setEditing] = useState<Datastore | null>(null);
+  return (
+    <Card title="Datastores" pad={false}>
+      <div className="card-body muted small" style={{ paddingBottom: 0 }}>
+        Backups of VMs on an NFS datastore read the disk files straight from the NAS over a read-only mount, so neither vCenter nor the
+        ESXi host carries any data. Give the address this server can reach the export at (it may differ from the storage-network address
+        ESXi uses).
+      </div>
+      {ds.error && <Alert>{errorText(ds.error)}</Alert>}
+      {ds.isLoading ? (
+        <Loading />
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Datastore</th>
+                <th>Type</th>
+                <th>As seen by ESXi</th>
+                <th>Backup data path</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {ds.data?.map((d) => (
+                <tr key={d.moref}>
+                  <td>
+                    <strong>{d.name}</strong>
+                    <div className="muted small">
+                      {bytes(d.free)} free of {bytes(d.capacity)}
+                    </div>
+                  </td>
+                  <td>{d.type}</td>
+                  <td className="mono small">{d.type === "NFS" || d.type === "NFS41" ? `${d.remote_host}:${d.remote_path}` : "—"}</td>
+                  <td>
+                    {d.direct_nfs?.enabled ? (
+                      <span className="row gap-s">
+                        <Badge tone="good">direct NFS, read-only</Badge>
+                        <span className="mono small">
+                          {d.direct_nfs.nfs_server}:{d.direct_nfs.nfs_export}
+                        </span>
+                      </span>
+                    ) : (
+                      <span className="row gap-s">
+                        <Badge tone="warn">VDDK</Badge>
+                        <span className="muted small">data via the ESXi host</span>
+                      </span>
+                    )}
+                  </td>
+                  <td className="right">
+                    {can("admin") && d.type.startsWith("NFS") && <Button onClick={() => setEditing(d)}>Configure</Button>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {editing && (
+        <DirectNfsEditor
+          vcId={vcId}
+          ds={editing}
+          onClose={() => setEditing(null)}
+          onDone={() => {
+            setEditing(null);
+            qc.invalidateQueries({ queryKey: ["datastores", vcId] });
+            qc.invalidateQueries({ queryKey: ["repositories"] });
+          }}
+        />
+      )}
+    </Card>
+  );
+}
+
+interface DsTest {
+  ok: boolean;
+  message: string;
+  read_only?: boolean;
+  folders?: string[];
+  nfs_version?: string;
+}
+
+function DirectNfsEditor({ vcId, ds, onClose, onDone }: { vcId: number; ds: Datastore; onClose: () => void; onDone: () => void }) {
+  const cur = ds.direct_nfs;
+  const [server, setServer] = useState(cur?.nfs_server ?? ds.remote_host);
+  const [exp, setExp] = useState(cur?.nfs_export ?? ds.remote_path);
+  const [options, setOptions] = useState(cur?.nfs_options ?? "nfsvers=4,hard");
+  const [test, setTest] = useState<DsTest | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const base = `/api/vcenters/${vcId}/datastores/${encodeURIComponent(ds.name)}/direct-nfs`;
+  const body = { nfs_server: server.trim(), nfs_export: exp.trim(), nfs_options: options.trim(), enabled: true };
+
+  async function run(fn: () => Promise<void>) {
+    setBusy(true);
+    setError("");
+    try {
+      await fn();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const holesHint =
+    test?.ok && test.nfs_version && !test.nfs_version.startsWith("4.2")
+      ? ` NFS ${test.nfs_version} cannot report unallocated regions, so a first full backup reads the whole disk size; later backups read only changed blocks.`
+      : "";
+
+  return (
+    <Modal
+      title={`Direct NFS access to ${ds.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          {cur && (
+            <Button variant="ghost" busy={busy} onClick={() => run(async () => { await del(base); onDone(); })}>
+              Remove
+            </Button>
+          )}
+          <div className="grow" />
+          <Button onClick={onClose}>Cancel</Button>
+          <Button busy={busy} onClick={() => run(async () => setTest(await post<DsTest>(`${base}/test`, body)))}>
+            Test
+          </Button>
+          <Button variant="primary" busy={busy} disabled={!test?.ok} onClick={() => run(async () => { await put(base, body); onDone(); })}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <div className="stack">
+        <Alert tone="info">
+          ESXi mounts this datastore from <code>{ds.remote_host}:{ds.remote_path}</code>. If that address is on a storage network this
+          server cannot reach, enter the NAS address that it can. The export is always mounted read-only.
+        </Alert>
+        <Alert>{error}</Alert>
+        <div className="form-grid">
+          <Field label="NFS server (reachable from this server)">
+            <input value={server} onChange={(e) => { setServer(e.target.value); setTest(null); }} />
+          </Field>
+          <Field label="Export path">
+            <input value={exp} onChange={(e) => { setExp(e.target.value); setTest(null); }} />
+          </Field>
+          <Field label="Mount options" hint='"ro" is always added; "rw" is refused'>
+            <input className="mono" value={options} onChange={(e) => { setOptions(e.target.value); setTest(null); }} />
+          </Field>
+        </div>
+        {test && (
+          <Alert tone={test.ok ? "good" : "bad"}>
+            {test.message}
+            {test.ok && test.nfs_version ? ` NFS version ${test.nfs_version}.` : ""}
+            {holesHint}
+          </Alert>
+        )}
+        {test?.ok && test.folders && test.folders.length > 0 && (
+          <div className="muted small">Folders: {test.folders.slice(0, 20).join(", ")}{test.folders.length > 20 ? ", …" : ""}</div>
+        )}
       </div>
     </Modal>
   );

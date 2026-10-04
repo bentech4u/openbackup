@@ -9,12 +9,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from croniter import croniter
+from sqlalchemy import select
 
 from .auth.secrets import decrypt
 from .config import get_settings
-from .db.models import RepoKind, VCenter
+from .db.models import DatastoreAccess, RepoKind, VCenter
 from .db.models import Repository as RepoRow
-from .engine.source import VSphereSource
+from .engine.source import DirectNfsAccess, VSphereSource
 from .repo import nfs
 from .repo.repository import Repository
 
@@ -55,10 +56,21 @@ def open_repository(row: RepoRow) -> Iterator[Repository]:
         repo.close()
 
 
+def direct_nfs_access(vcenter_id: int) -> list[DirectNfsAccess]:
+    from .db import session_scope
+
+    with session_scope() as db:
+        rows = db.scalars(select(DatastoreAccess).where(DatastoreAccess.vcenter_id == vcenter_id,
+                                                        DatastoreAccess.enabled.is_(True)))
+        return [DirectNfsAccess(r.id, r.datastore, r.nfs_server, r.nfs_export, r.nfs_options)
+                for r in rows]
+
+
 def vsphere_source(vc: VCenter) -> VSphereSource:
     s = get_settings()
     return VSphereSource(vc.host, vc.username, decrypt(vc.password_enc), vc.thumbprint,
-                         port=vc.port, vddk_libdir=s.vddk_libdir, nbdkit=s.nbdkit)
+                         port=vc.port, vddk_libdir=s.vddk_libdir, nbdkit=s.nbdkit,
+                         direct_nfs=direct_nfs_access(vc.id), mount_root=s.mount_root)
 
 
 def next_run(cron: str, after: datetime | None = None) -> datetime:

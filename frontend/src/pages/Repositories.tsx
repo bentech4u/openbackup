@@ -127,6 +127,12 @@ function RepoBody({ repo }: { repo: Repository }) {
   const merged = stats.data ? { ...repo, capacity_bytes: stats.data.capacity_bytes, free_bytes: stats.data.free_bytes } : repo;
   return (
     <div className="stack">
+      {repo.shares_datastore && (
+        <Alert tone="warn">
+          This repository is inside the same NFS export as datastore <strong>{repo.shares_datastore}</strong>. If that volume or NAS
+          fails, the VMs and their backups are lost together. Use a separate share, ideally on another NAS, for real protection.
+        </Alert>
+      )}
       <dl className="kv">
         <dt>Location</dt>
         <dd className="mono small">

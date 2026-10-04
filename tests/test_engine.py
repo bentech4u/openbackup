@@ -213,3 +213,31 @@ def test_export_vmdk(env):
     raw = tmp / "check.raw"
     subprocess.run(["qemu-img", "convert", "-O", "raw", str(out), str(raw)], check=True)
     assert raw.read_bytes() == vs.read(vm, 2000)
+
+
+def test_direct_nfs_backup_round_trip(env):
+    vs, repo, tmp = env
+    vs.direct = True
+    vm = vs.add_vm("nfs01", [16 * MiB])
+    vs.write(vm, 2000, 0, os.urandom(3 * MiB))
+    ctx = NullContext()
+    r1 = backup_vm(vs, repo, vm.moref, BackupOptions(), ctx)
+    assert any("direct NFS" in m for _, m in ctx.messages)
+    vs.write(vm, 2000, 9 * MiB, os.urandom(10))
+    r2 = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    assert r2.manifest["kind"] == "incremental" and r2.manifest["read_bytes"] == MiB
+    assert _restore_bytes(repo, r2.point_id, tmp) == [vs.read(vm, 2000)]
+    assert r1.point_id != r2.point_id
+
+
+def test_direct_nfs_refuses_vm_with_own_snapshots(env):
+    from openbackup.vsphere.nfsdirect import DirectNfsError
+
+    vs, repo, _ = env
+    vs.direct = True
+    vs.foreign_snapshot = True
+    vm = vs.add_vm("snappy", [4 * MiB])
+    vm.cbt = True
+    with pytest.raises(DirectNfsError, match="snapshots of its own"):
+        backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    assert vm.snapshots == []  # ours was still removed

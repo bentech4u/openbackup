@@ -11,6 +11,7 @@ from .routers import (
     audit,
     auth,
     dashboard,
+    datastores,
     inventory,
     jobs,
     points,
@@ -51,8 +52,8 @@ def create_app(*, create_tables: bool = True) -> FastAPI:
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    for r in (auth, users, audit, vcenters, inventory, repositories, jobs, tasks, points,
-              dashboard):
+    for r in (auth, users, audit, vcenters, inventory, datastores, repositories, jobs, tasks,
+              points, dashboard):
         app.include_router(r.router)
 
     @app.get("/api/health", include_in_schema=False)

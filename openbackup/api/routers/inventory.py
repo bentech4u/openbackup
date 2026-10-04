@@ -38,6 +38,8 @@ def _fetch(vc: VCenter, what: str, refresh: bool):
     try:
         if what == "vms":
             data = [v.to_dict() for v in vs.list_vms()]
+        elif what == "datastores":
+            data = vs.list_datastores()
         elif what == "placement":
             data = asdict(vs.placement_options())
         else:

@@ -47,6 +47,8 @@ class RepositoryOut(ORM):
     capacity_bytes: int | None
     free_bytes: int | None
     created_at: datetime
+    # Datastore whose NFS export this repository lives in, if any.
+    shares_datastore: str | None = None
 
 
 class JobOut(ORM):

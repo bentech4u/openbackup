@@ -52,6 +52,7 @@ class NbdClient:
         self._handle = 0
         self.size = 0
         self.flags = 0
+        self.description = ""
 
     # --------------------------------------------------------------- connect
 

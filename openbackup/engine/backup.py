@@ -220,6 +220,11 @@ def _plan_disk(source, repo, vm, snap, d: DiskInfo, prev, active_full, ctx, name
                 reason = f"CBT could not be used ({e})"
         warn(f"{d.label}: {reason}; reading the full disk")
 
+    alloc = getattr(source, "allocated_extents", None)
+    if alloc is not None:
+        found = alloc(d)
+        if found is not None:
+            return BlockMap(d.capacity), [Extent(o, n) for o, n in found], "full"
     try:
         extents = source.changed_areas(vm, snap, d, "*")
         return BlockMap(d.capacity), extents, "full"
@@ -231,8 +236,8 @@ def _plan_disk(source, repo, vm, snap, d: DiskInfo, prev, active_full, ctx, name
 
 def _copy_blocks(source, vm_moref: str, snap_moref: str, d: DiskInfo, m: BlockMap,
                  blocks: list[int], writer, ctx: TaskContext, item: str, depth: int) -> int:
-    if not blocks:
-        return 0
+    # The disk is opened even when no blocks changed: opening is what checks
+    # its size and, for direct NFS, that it is a current base disk.
     read = reported_read = 0
     reported_new = writer.new_bytes
     last_report = time.monotonic()
@@ -244,8 +249,10 @@ def _copy_blocks(source, vm_moref: str, snap_moref: str, d: DiskInfo, m: BlockMa
         ctx.item(item, read=read)
 
     with source.open_disk(vm_moref, d, snapshot_moref=snap_moref) as nbd:
+        if getattr(nbd, "description", ""):
+            ctx.log(f"{item}: reading via {nbd.description}")
         if nbd.size != d.capacity:
-            raise BackupError(f"{d.label}: NBD export is {nbd.size} bytes, vSphere reports "
+            raise BackupError(f"{d.label}: disk source is {nbd.size} bytes, vSphere reports "
                               f"{d.capacity}")
         reqs = ((i * m.block_size, m.block_length(i)) for i in blocks)
         for i, data in zip(blocks, nbd.pread_many(reqs, depth=depth), strict=True):

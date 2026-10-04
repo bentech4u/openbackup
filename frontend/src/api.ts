@@ -57,6 +57,19 @@ export interface Repository {
   capacity_bytes: number | null;
   free_bytes: number | null;
   created_at: string;
+  shares_datastore: string | null;
+}
+
+export interface Datastore {
+  moref: string;
+  name: string;
+  type: string;
+  capacity: number;
+  free: number;
+  accessible: boolean;
+  remote_host: string;
+  remote_path: string;
+  direct_nfs: { nfs_server: string; nfs_export: string; nfs_options: string; enabled: boolean } | null;
 }
 
 export interface Job {

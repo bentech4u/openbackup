@@ -51,6 +51,10 @@ class FakeVSphere:
         self.fail_remove_snapshot = False
         self.cbt_broken = False
         self.calls: list[str] = []
+        # Serve snapshot disks as flat VMDKs read through FlatDisk, the way
+        # direct NFS reads a datastore.
+        self.direct = False
+        self.foreign_snapshot = False
 
     # ---------------------------------------------------------- test helpers
 
@@ -113,8 +117,17 @@ class FakeVSphere:
         self._n += 1
         files = {}
         for key, f in vm.files.items():
-            snapf = f.with_name(f"{f.stem}-snap{self._n}.img")
-            shutil.copyfile(f, snapf)
+            if self.direct:
+                stem = f"{f.stem}-snap{self._n}"
+                snapf = f.with_name(f"{stem}-flat.vmdk")
+                shutil.copyfile(f, snapf)
+                parent = "0000abcd" if self.foreign_snapshot else "ffffffff"
+                f.with_name(f"{stem}.vmdk").write_text(
+                    f'parentCID={parent}\ncreateType="vmfs"\n'
+                    f'RW {snapf.stat().st_size // 512} VMFS "{snapf.name}"\n')
+            else:
+                snapf = f.with_name(f"{f.stem}-snap{self._n}.img")
+                shutil.copyfile(f, snapf)
             files[key] = snapf
         snap = FakeSnapshot(f"snapshot-{self._n}", name, files, vm.gen)
         vm.snapshots.append(snap)
@@ -134,6 +147,7 @@ class FakeVSphere:
                 vm.snapshots.remove(snap)
                 for f in snap.files.values():
                     f.unlink(missing_ok=True)
+                    f.with_name(f.name.replace("-flat.vmdk", ".vmdk")).unlink(missing_ok=True)
         self.snapshot_removals += 1
 
     def changed_areas(self, vm: FakeVm, snap: FakeSnapshot, disk: DiskInfo,
@@ -162,6 +176,13 @@ class FakeVSphere:
             vm = self.vms[vm_moref]
             snap = next(s for s in vm.snapshots if s.moref == snapshot_moref)
             path = snap.files[disk.key]
+            if self.direct and not write:
+                from openbackup.vsphere.nfsdirect import FlatDisk, resolve_base_flat
+
+                desc = path.with_name(path.name.replace("-flat.vmdk", ".vmdk"))
+                with FlatDisk(resolve_base_flat(desc), "direct NFS (fake)") as fd:
+                    yield fd
+                return
         else:
             path = self.vms[vm_moref].files[disk.key]
         with Nbdkit(["file", f"file={path}"], readonly=not write) as srv, \

@@ -205,6 +205,21 @@ class VSphere:
             ))
         return sorted(out, key=lambda v: v.name.lower())
 
+    def list_datastores(self) -> list[dict]:
+        out = []
+        for obj, p in self._collect(vim.Datastore, ["name", "summary.type", "summary.capacity",
+                                                    "summary.freeSpace", "summary.accessible",
+                                                    "info"]):
+            nas = getattr(p.get("info"), "nas", None)
+            out.append({
+                "moref": _moref(obj), "name": p["name"], "type": p.get("summary.type", ""),
+                "capacity": p.get("summary.capacity", 0), "free": p.get("summary.freeSpace", 0),
+                "accessible": bool(p.get("summary.accessible")),
+                "remote_host": getattr(nas, "remoteHost", "") or "" if nas else "",
+                "remote_path": getattr(nas, "remotePath", "") or "" if nas else "",
+            })
+        return sorted(out, key=lambda d: d["name"].lower())
+
     def placement_options(self) -> PlacementOptions:
         po = PlacementOptions()
         for obj, p in self._collect(vim.Datacenter, ["name", "vmFolder"]):

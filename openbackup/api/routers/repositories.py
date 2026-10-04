@@ -15,7 +15,7 @@ from ... import services
 from ...auth.passwords import MIN_LENGTH
 from ...auth.secrets import encrypt
 from ...config import get_settings
-from ...db.models import Job, RepoKind, Task, TaskKind, TaskState
+from ...db.models import DatastoreAccess, Job, RepoKind, Task, TaskKind, TaskState
 from ...db.models import Repository as RepoRow
 from ...repo import nfs
 from ...repo.crypto import WrongPassphrase
@@ -94,7 +94,15 @@ def _check(row: RepoRow) -> dict:
 
 @router.get("", response_model=list[RepositoryOut])
 def list_repos(db: Session = Depends(get_db), _: Principal = Depends(viewer)):
-    return list(db.scalars(select(RepoRow).order_by(RepoRow.name)))
+    exports = {(a.nfs_server, a.nfs_export.rstrip("/")): a.datastore
+               for a in db.scalars(select(DatastoreAccess))}
+    out = []
+    for r in db.scalars(select(RepoRow).order_by(RepoRow.name)):
+        o = RepositoryOut.model_validate(r)
+        if r.kind == RepoKind.nfs:
+            o.shares_datastore = exports.get((r.nfs_server, r.nfs_export.rstrip("/")))
+        out.append(o)
+    return out
 
 
 def _test(body: RepoTestIn) -> dict:

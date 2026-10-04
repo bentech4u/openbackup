@@ -75,3 +75,28 @@ def test_mount_failure_is_reported(tmp_path):
     with pytest.raises(nfs.NfsError):
         nfs.ensure_mounted(SERVER, "/does/not/exist", tmp_path / "m",
                            "nfsvers=4.2,hard,timeo=10,retrans=1")
+
+
+def test_read_only_mount_refuses_writes(tmp_path):
+    mp = tmp_path / "ds"
+    try:
+        ours = nfs.ensure_mounted(SERVER, EXPORT, mp, "nfsvers=4.2,hard,timeo=50,retrans=2",
+                                  read_only=True)
+    except nfs.NfsError as e:
+        pytest.skip(f"cannot mount {TARGET}: {e}")
+    try:
+        info = nfs.find_mount(mp)
+        assert info is not None and info.read_only
+        assert info.nfs_version.startswith("4")
+        with pytest.raises(OSError):
+            (mp / "should-not-exist").write_text("x")
+        # Adopting is fine while it stays read-only.
+        assert nfs.ensure_mounted(SERVER, EXPORT, mp, read_only=True) is False
+    finally:
+        if ours:
+            nfs.unmount(mp)
+
+
+def test_read_only_refuses_to_adopt_read_write_mount(mounted):
+    with pytest.raises(nfs.NfsError, match="read-write"):
+        nfs.ensure_mounted(SERVER, EXPORT, mounted.parent, read_only=True)

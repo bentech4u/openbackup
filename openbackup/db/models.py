@@ -23,6 +23,7 @@ from sqlalchemy import (
     String,
     Text,
     TypeDecorator,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -133,6 +134,24 @@ class VCenter(Base):
     password_enc: Mapped[str] = mapped_column(Text)
     # SHA-1 colon-hex as VDDK expects; pinned when the vCenter is added.
     thumbprint: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class DatastoreAccess(Base):
+    """How this server reads an NFS datastore directly. The address vSphere
+    uses (often a storage VLAN) may not be routable from here, so the
+    administrator supplies one that is. Always mounted read-only."""
+
+    __tablename__ = "datastore_access"
+    __table_args__ = (UniqueConstraint("vcenter_id", "datastore"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vcenter_id: Mapped[int] = mapped_column(ForeignKey("vcenters.id", ondelete="CASCADE"))
+    datastore: Mapped[str] = mapped_column(String(255))
+    nfs_server: Mapped[str] = mapped_column(String(255))
+    nfs_export: Mapped[str] = mapped_column(String(1024))
+    nfs_options: Mapped[str] = mapped_column(String(255), default="nfsvers=4,hard")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 

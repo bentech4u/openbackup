@@ -29,6 +29,15 @@ class MountInfo:
     source: str
     mountpoint: Path
     fstype: str
+    options: frozenset[str] = frozenset()
+
+    @property
+    def read_only(self) -> bool:
+        return "ro" in self.options
+
+    @property
+    def nfs_version(self) -> str:
+        return next((o.split("=", 1)[1] for o in self.options if o.startswith("vers=")), "")
 
 
 def _unescape(s: str) -> str:
@@ -42,7 +51,12 @@ def mounts() -> list[MountInfo]:
             left, _, right = line.partition(" - ")
             fields = left.split()
             rfields = right.split()
-            out.append(MountInfo(_unescape(rfields[1]), Path(_unescape(fields[4])), rfields[0]))
+            # Per-mount options (where "ro" lives) plus superblock options
+            # (where NFS reports its negotiated version).
+            opts = set(fields[5].split(",")) | set(rfields[2].split(",") if len(rfields) > 2
+                                                   else ())
+            out.append(MountInfo(_unescape(rfields[1]), Path(_unescape(fields[4])), rfields[0],
+                                 frozenset(opts)))
     return out
 
 
@@ -67,9 +81,13 @@ def validate(server: str, export: str, options: str) -> None:
 
 
 def ensure_mounted(server: str, export: str, mountpoint: Path,
-                   options: str = DEFAULT_OPTIONS, timeout: int = 60) -> bool:
+                   options: str = DEFAULT_OPTIONS, timeout: int = 60,
+                   read_only: bool = False) -> bool:
     """Mount if needed. Returns True if this call mounted it, False if it was
-    already mounted (in which case the caller must not unmount it)."""
+    already mounted (in which case the caller must not unmount it).
+
+    ``read_only`` is for production datastores: the mount gets ``ro``, and an
+    existing mount at the same place is only adopted if it is read-only too."""
     validate(server, export, options)
     source = f"{server}:{export}"
     existing = find_mount(mountpoint)
@@ -77,11 +95,18 @@ def ensure_mounted(server: str, export: str, mountpoint: Path,
         if not existing.fstype.startswith("nfs") or existing.source.rstrip("/") != \
                 source.rstrip("/"):
             raise NfsError(f"{mountpoint} is already mounted from {existing.source}")
+        if read_only and not existing.read_only:
+            raise NfsError(f"{mountpoint} is mounted read-write; refusing to use it for a "
+                           "datastore, which must only ever be mounted read-only")
         return False
     mountpoint.mkdir(parents=True, exist_ok=True)
     opts = options or DEFAULT_OPTIONS
-    if "hard" not in opts.split(","):
-        opts += ",hard"
+    parts = [o for o in opts.split(",") if o and o != "rw"]
+    if "hard" not in parts:
+        parts.append("hard")
+    if read_only and "ro" not in parts:
+        parts.insert(0, "ro")
+    opts = ",".join(parts)
     try:
         proc = subprocess.run(
             ["mount", "-t", "nfs", "-o", opts, "--", source, str(mountpoint)],
@@ -91,6 +116,11 @@ def ensure_mounted(server: str, export: str, mountpoint: Path,
         raise NfsError(f"Timed out mounting {source}") from None
     if proc.returncode != 0:
         raise NfsError(f"mount {source} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    if read_only:
+        info = find_mount(mountpoint)
+        if info is None or not info.read_only:
+            unmount(mountpoint)
+            raise NfsError(f"{source} did not mount read-only; unmounted it again")
     return True
 
 
