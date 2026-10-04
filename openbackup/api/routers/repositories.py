@@ -157,6 +157,11 @@ def _create(row: RepoRow, body: RepoIn) -> None:
 async def create_repo(body: RepoIn, request: Request, db: Session = Depends(get_db),
                       p: Principal = Depends(admin)):
     _validate(body)
+    if body.mode == "create" and body.passphrase is not None and not body.passphrase.strip():
+        # An empty passphrase must never silently mean "unencrypted".
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "Enter a passphrase to encrypt the repository, or create it "
+                            "unencrypted")
     if body.passphrase is not None and body.passphrase and len(body.passphrase) < MIN_LENGTH:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             f"Passphrase must be at least {MIN_LENGTH} characters")

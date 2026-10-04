@@ -527,3 +527,15 @@ def test_secrets_jobs_require_an_encrypted_repository(admin_api, setup, tmp_path
     # setup["repo_id"] is encrypted
     r = admin_api.post("/api/jobs", json={**body, "repository_id": setup["repo_id"]})
     assert r.status_code == 201 and r.json()["selection"]["include_secrets"] is True
+
+
+def test_empty_passphrase_never_means_unencrypted(admin_api, tmp_path):
+    r = admin_api.post("/api/repositories", json={
+        "name": "x", "kind": "local", "path": str(tmp_path / "x"), "passphrase": ""})
+    assert r.status_code == 400 and "passphrase" in r.json()["detail"]
+    r = admin_api.post("/api/repositories", json={
+        "name": "x", "kind": "local", "path": str(tmp_path / "x"), "passphrase": "   "})
+    assert r.status_code == 400
+    r = admin_api.post("/api/repositories", json={"name": "y", "kind": "local",
+                                                  "path": str(tmp_path / "y")})
+    assert r.status_code == 201 and r.json()["encrypted"] is False

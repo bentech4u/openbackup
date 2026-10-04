@@ -201,6 +201,10 @@ function AddRepository({ onClose, onDone }: { onClose: () => void; onDone: () =>
 
   async function save() {
     setError("");
+    if (!importing && encrypt && pass.length < 12) {
+      setError("Enter a passphrase of at least 12 characters, or untick Encrypt backups");
+      return;
+    }
     if (!importing && encrypt && pass !== pass2) {
       setError("The passphrases do not match");
       return;
