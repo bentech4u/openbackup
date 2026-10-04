@@ -4,6 +4,7 @@ nbdkit's vddk plugin. Tests substitute a fake with the same methods."""
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,7 +34,10 @@ class DirectNfsAccess:
     options: str = "nfsvers=3,hard"
 
     def mountpoint(self, root: Path) -> Path:
-        return root / f"ds-{self.id}"
+        # Named after the address and options: changing them gives new tasks
+        # a fresh mount while running ones finish on the old one.
+        h = hashlib.sha1(f"{self.server}|{self.export}|{self.options}".encode()).hexdigest()
+        return root / f"ds-{self.id}-{h[:8]}"
 
 
 class VSphereSource(VSphere):
