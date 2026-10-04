@@ -20,8 +20,7 @@ export default function Layout() {
     <div className="shell">
       <aside className="sidebar">
         <div className="brand">
-          <img src="/favicon.svg" alt="" />
-          OpenBackup
+          <img src="/logo.png" alt="OpenBackup" className="brand-logo" />
         </div>
         <nav className="nav">
           <NavLink to="/" end>

@@ -3,6 +3,19 @@ import { useAuth } from "../auth";
 import { Alert, Button, Field, errorText } from "../components/ui";
 import { post } from "../api";
 
+// The card follows the light/dark theme; the wordmark's "Open" is white on
+// dark and navy on light.
+function BrandLogo() {
+  return (
+    <div className="brand">
+      <picture>
+        <source srcSet="/logo.png" media="(prefers-color-scheme: dark)" />
+        <img src="/logo-light.png" alt="OpenBackup" className="brand-logo" />
+      </picture>
+    </div>
+  );
+}
+
 export function Login() {
   const { login } = useAuth();
   const [username, setUsername] = useState("");
@@ -27,10 +40,7 @@ export function Login() {
   return (
     <div className="login-wrap">
       <form className="login-card stack" onSubmit={submit}>
-        <div className="brand">
-          <img src="/favicon.svg" alt="" />
-          OpenBackup
-        </div>
+        <BrandLogo />
         <Alert>{error}</Alert>
         <Field label="Username">
           <input autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} required />
@@ -111,10 +121,7 @@ export function ForcedPasswordChange() {
   return (
     <div className="login-wrap">
       <div className="login-card">
-        <div className="brand">
-          <img src="/favicon.svg" alt="" />
-          OpenBackup
-        </div>
+        <BrandLogo />
         <PasswordForm forced />
       </div>
     </div>
