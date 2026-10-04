@@ -43,7 +43,12 @@ class FcdDisk:
     def allocated_extents(self) -> list[tuple[int, int]] | None:
         with self.open() as r:
             alloc = getattr(r, "allocated_extents", None)
-            return alloc() if alloc else None
+            found = alloc() if alloc else None
+        if found is None and not self.info.cbt:
+            # Without CBT vSphere cannot say what is allocated either; read the
+            # whole volume rather than ask and warn a second time.
+            return [(0, self.capacity)]
+        return found
 
     def open(self):
         flat = self.open_flat(self.disk)
@@ -127,6 +132,7 @@ def volume_backup(fcd, open_flat, prev_manifest: dict | None, load_prev_map,
             if not info.cbt:
                 try:
                     fcd.enable_cbt(fcd_id)
+                    info.cbt = True
                     ctx.log(f"{name}: {pvc}: enabled Changed Block Tracking")
                 except VSphereError as e:
                     # Typical for a volume attached to a running node: its CBT

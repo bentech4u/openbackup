@@ -153,6 +153,7 @@ def test_attached_volume_without_cbt_is_read_in_full(env):
     seed(fk, {"data": ("csi.vsphere.vmware.com", a)})
     m1 = run(fk, fcd, repo)
     assert any("could not be enabled" in w for w in m1["warnings"])
+    assert len(m1["warnings"]) == 1  # one warning per volume, not two
     # Without CBT the volume is read whole, or only its data where the storage
     # reports holes itself (this local test filesystem does; NFS v3 does not).
     assert MiB <= m1["read_bytes"] <= 4 * MiB
