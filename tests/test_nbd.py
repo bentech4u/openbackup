@@ -91,3 +91,21 @@ def test_vddk_args_shape():
     assert args[0] == "vddk"
     assert "vm=moref=vm-1" in args and "snapshot=snapshot-9" in args
     assert not any(a.startswith("password") for a in args)
+
+
+def test_crash_is_reported_as_a_crash(tmp_path):
+    # A plugin that dies with SIGSEGV on the first read, like a faulty VDDK.
+    script = tmp_path / "crash.sh"
+    script.write_text("""#!/bin/sh
+case "$1" in
+  get_size) echo 1048576 ;;
+  pread) kill -SEGV $PPID; sleep 5 ;;
+  *) exit 2 ;;
+esac
+""")
+    script.chmod(0o755)
+    with Nbdkit(["sh", str(script)]) as srv, srv.connect() as c:
+        with pytest.raises((NbdError, OSError)):
+            c.pread(0, 512)
+        reason = srv.failure_reason()
+    assert "crashed (SIGSEGV)" in reason

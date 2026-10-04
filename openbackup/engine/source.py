@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from ..nbd.client import NbdClient
+from ..nbd.client import NbdClient, NbdError
 from ..nbd.nbdkit import Nbdkit, VddkTarget
 from ..vsphere.client import VSphere
 from ..vsphere.types import DiskInfo
@@ -39,4 +39,7 @@ class VSphereSource(VSphere):
         )
         with Nbdkit.vddk(target, readonly=not write, nbdkit=self.nbdkit) as srv, \
                 srv.connect() as client:
-            yield client
+            try:
+                yield client
+            except (NbdError, OSError) as e:
+                raise NbdError(f"{e}; {srv.failure_reason()}") from None

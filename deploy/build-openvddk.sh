@@ -21,12 +21,27 @@ if [ -d "$SRC/.git" ]; then
 else
     git clone "$REPO" "$SRC"
 fi
+git -C "$SRC" checkout -- .
 if [ -n "$REF" ]; then
     git -C "$SRC" checkout "$REF"
 else
     git -C "$SRC" pull --ff-only
 fi
 echo "Building OpenVDDK at $(git -C "$SRC" rev-parse --short HEAD)"
+
+# Make OpenVDDK binary-compatible with VMware's VDDK as nbdkit's vddk plugin
+# uses it (see the patch header). Skipped once upstream contains the fix.
+PATCH="$(dirname "$(readlink -f "$0")")/openvddk-abi.patch"
+git -C "$SRC" checkout -- .
+if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
+    git -C "$SRC" apply "$PATCH"
+    echo "Applied $(basename "$PATCH")"
+elif git -C "$SRC" apply --reverse --check "$PATCH" 2>/dev/null; then
+    echo "Upstream already contains the ABI fix"
+else
+    echo "openvddk-abi.patch does not apply to this revision; review it" >&2
+    exit 1
+fi
 
 cmake -S "$SRC" -B "$SRC/build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$SRC/build" -j"$(nproc)"

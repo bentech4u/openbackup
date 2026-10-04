@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -114,11 +115,37 @@ class Nbdkit:
             time.sleep(0.05)
         return self
 
+    def failure_reason(self) -> str:
+        """Why nbdkit stopped serving, for error messages: its exit status
+        (a crash in the VDDK library shows up as a signal) and its output."""
+        parts = []
+        if self._proc is not None:
+            rc = self._proc.poll()
+            if rc is None:
+                time.sleep(0.2)  # a crashing process may still be exiting
+                rc = self._proc.poll()
+            if rc is not None and rc < 0:
+                try:
+                    name = signal.Signals(-rc).name
+                except ValueError:
+                    name = f"signal {-rc}"
+                parts.append(f"nbdkit crashed ({name}); this is usually a fault in the VDDK "
+                             f"library at {self._vddk_libdir() or 'the configured libdir'}")
+            elif rc is not None:
+                parts.append(f"nbdkit exited with status {rc}")
+        tail = self._stderr_tail()
+        if tail:
+            parts.append(f"nbdkit output: {tail}")
+        return "; ".join(parts) or "nbdkit gave no further detail"
+
+    def _vddk_libdir(self) -> str:
+        return next((a.split("=", 1)[1] for a in self.plugin_args if a.startswith("libdir=")), "")
+
     def connect(self) -> NbdClient:
         try:
             return NbdClient.connect_unix(str(self.socket))
-        except NbdError as e:
-            raise NbdError(f"{e}; nbdkit says: {self._stderr_tail()}") from None
+        except (NbdError, OSError) as e:
+            raise NbdError(f"{e}; {self.failure_reason()}") from None
 
     def stop(self) -> None:
         if self._proc is not None and self._proc.poll() is None:

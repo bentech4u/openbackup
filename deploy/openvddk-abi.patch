@@ -1,0 +1,286 @@
+OpenVDDK: match VMware's VDDK ABI where nbdkit's vddk plugin depends on it
+
+Found when nbdkit 1.38 (vddk plugin) segfaulted opening any disk:
+
+1. VixDiskLib_AllocateConnectParams took an out-parameter and returned an
+   error code. VMware's signature is
+   `VixDiskLibConnectParams *VixDiskLib_AllocateConnectParams(void)`, so
+   callers got 0 back as the struct pointer and wrote through NULL.
+2. VixDiskLibConnectParams lacked reserved3/reserved4/reserved5 and placed
+   specType before spec. Callers write specType at offset 120, past the end
+   of the 112-byte struct OpenVDDK allocated.
+3. VixDiskLib_FreeConnectParams freed the strings inside the struct.
+   VMware's frees only the struct; callers own those strings (nbdkit points
+   them at its own config buffers), so this was an invalid free.
+4. VixDiskLibDiskInfo lacked uuid/logicalSectorSize/physicalSectorSize,
+   which callers read when the library reports version >= 7 (OpenVDDK
+   reports 8).
+5. ReadAsync/WriteAsync returned VIX_OK for a queued request. VMware returns
+   VIX_ASYNC and delivers the result to the callback; nbdkit fails every
+   read otherwise ("VixDiskLib_ReadAsync: The operation was successful").
+
+Static assertions pin the LP64 offsets so a regression fails the build.
+
+diff --git a/include/openvddk/types.h b/include/openvddk/types.h
+index 149b5f1..7f52fc9 100644
+--- a/include/openvddk/types.h
++++ b/include/openvddk/types.h
+@@ -137,6 +137,12 @@ typedef uint8_t Bool;
+ /* VixError definition: 64-bit status code */
+ typedef uint64_t VixError;
+ 
++/* Returned by ReadAsync/WriteAsync when the request was queued; the result
++ * is delivered to the completion callback (VMware VDDK semantics). */
++#ifndef VIX_ASYNC
++#define VIX_ASYNC ((VixError)25000)
++#endif
++
+ /* Sector offset/count type */
+ typedef uint64_t VixDiskLibSectorType;
+ 
+@@ -246,6 +252,11 @@ typedef struct {
+     VixDiskLibAdapterType adapterType;
+     int32_t numLinks;
+     char *parentFileNameHint;
++    /* Present in VMware's struct since VDDK 7; callers that see library
++     * version >= 7 read them. */
++    char *uuid;
++    uint32_t logicalSectorSize;
++    uint32_t physicalSectorSize;
+ } VixDiskLibDiskInfo;
+ 
+ /*
+@@ -292,6 +303,8 @@ typedef struct {
+ } VixDiskLibVStorageObjectSpec;
+ 
+ typedef struct VixDiskLibConnectParams {
++    /* Layout matches VMware's vixDiskLib.h exactly: callers such as nbdkit's
++     * vddk plugin allocate and fill this struct by offset. */
+     char *vmxSpec;
+     char *serverName;
+     char *thumbPrint;
+@@ -300,12 +313,14 @@ typedef struct VixDiskLibConnectParams {
+     VixDiskLibCreds creds;
+     uint32_t port;
+     uint32_t nfcHostPort;
+-    VixDiskLibSpecType specType;
++    char *reserved3;
++    char reserved4[8];
++    void *reserved5;
+     union {
+         char *vmxSpec;
+         VixDiskLibVStorageObjectSpec vStorageObjectSpec;
+     } spec;
+-    char *identity;
++    VixDiskLibSpecType specType;
+ } VixDiskLibConnectParams;
+ 
+ /*
+diff --git a/include/vixDiskLib.h b/include/vixDiskLib.h
+index 264c370..3a897c7 100644
+--- a/include/vixDiskLib.h
++++ b/include/vixDiskLib.h
+@@ -47,9 +47,9 @@ VixError VixDiskLib_Disconnect(VixDiskLibConnection connection);
+ /*
+  * Connect Parameters Allocation Helpers
+  */
+-VixError VixDiskLib_AllocateConnectParams(VixDiskLibConnectParams **connectParams);
++VixDiskLibConnectParams *VixDiskLib_AllocateConnectParams(void);
+ 
+-VixError VixDiskLib_FreeConnectParams(VixDiskLibConnectParams *connectParams);
++void VixDiskLib_FreeConnectParams(VixDiskLibConnectParams *connectParams);
+ 
+ /*
+  * Virtual Disk Open and Close
+diff --git a/src/vix_disklib.c b/src/vix_disklib.c
+index da1c053..2cdc95b 100644
+--- a/src/vix_disklib.c
++++ b/src/vix_disklib.c
+@@ -1,3 +1,4 @@
++#include <stddef.h>
+ /*
+  * OpenVDDK - Open-Source Virtual Disk Development Kit
+  * Clean-room, high-performance drop-in replacement for VMware VDDK.
+@@ -319,76 +320,34 @@ VixError VixDiskLib_Disconnect(VixDiskLibConnection connection)
+     return VIX_OK;
+ }
+ 
+-VixError VixDiskLib_AllocateConnectParams(VixDiskLibConnectParams **connectParams)
+-{
+-    if (connectParams == NULL) {
+-        return VIX_E_INVALID_ARG;
+-    }
+-
+-    VixDiskLibConnectParams *p = (VixDiskLibConnectParams *)calloc(1U, sizeof(VixDiskLibConnectParams));
+-    if (p == NULL) {
+-        return VIX_E_OUT_OF_MEMORY;
+-    }
++#if defined(__LP64__)
++/* Offsets VMware's VDDK (and nbdkit's vddk plugin) use on LP64 platforms. */
++_Static_assert(offsetof(VixDiskLibConnectParams, creds) == 40, "ConnectParams.creds offset");
++_Static_assert(offsetof(VixDiskLibConnectParams, port) == 64, "ConnectParams.port offset");
++_Static_assert(offsetof(VixDiskLibConnectParams, spec) == 96, "ConnectParams.spec offset");
++_Static_assert(offsetof(VixDiskLibConnectParams, specType) == 120, "ConnectParams.specType offset");
++_Static_assert(sizeof(VixDiskLibConnectParams) == 128, "ConnectParams size");
++_Static_assert(offsetof(VixDiskLibDiskInfo, capacity) == 24, "DiskInfo.capacity offset");
++_Static_assert(offsetof(VixDiskLibDiskInfo, uuid) == 48, "DiskInfo.uuid offset");
++_Static_assert(offsetof(VixDiskLibDiskInfo, logicalSectorSize) == 56, "DiskInfo.logicalSectorSize offset");
++_Static_assert(offsetof(VixDiskLibDiskInfo, physicalSectorSize) == 60, "DiskInfo.physicalSectorSize offset");
++#endif
+ 
+-    *connectParams = p;
+-    return VIX_OK;
++/*
++ * VMware ABI: returns a zeroed struct (NULL on allocation failure). The
++ * caller owns every string it stores in the struct; FreeConnectParams
++ * releases only the struct itself, exactly like VMware's VDDK. Freeing the
++ * caller's strings here would be an invalid free in nbdkit, which points
++ * these fields at its own configuration buffers.
++ */
++VixDiskLibConnectParams *VixDiskLib_AllocateConnectParams(void)
++{
++    return (VixDiskLibConnectParams *)calloc(1U, sizeof(VixDiskLibConnectParams));
+ }
+ 
+-VixError VixDiskLib_FreeConnectParams(VixDiskLibConnectParams *connectParams)
++void VixDiskLib_FreeConnectParams(VixDiskLibConnectParams *connectParams)
+ {
+-    if (connectParams != NULL) {
+-        if (connectParams->vmxSpec) {
+-            free(connectParams->vmxSpec);
+-        }
+-        if (connectParams->serverName) {
+-            free(connectParams->serverName);
+-        }
+-        if (connectParams->thumbPrint) {
+-            free(connectParams->thumbPrint);
+-        }
+-        if (connectParams->identity) {
+-            free(connectParams->identity);
+-        }
+-        if (connectParams->credType == VIXDISKLIB_CRED_UID) {
+-            if (connectParams->creds.uid.userName) {
+-                free(connectParams->creds.uid.userName);
+-            }
+-            if (connectParams->creds.uid.password) {
+-                free(connectParams->creds.uid.password);
+-            }
+-        } else if (connectParams->credType == VIXDISKLIB_CRED_SESSIONID) {
+-            if (connectParams->creds.sessionId.cookie) {
+-                free(connectParams->creds.sessionId.cookie);
+-            }
+-            if (connectParams->creds.sessionId.userName) {
+-                free(connectParams->creds.sessionId.userName);
+-            }
+-            if (connectParams->creds.sessionId.key) {
+-                free(connectParams->creds.sessionId.key);
+-            }
+-        } else if (connectParams->credType == VIXDISKLIB_CRED_TICKETID) {
+-            if (connectParams->creds.ticketId.ticket) {
+-                free(connectParams->creds.ticketId.ticket);
+-            }
+-        }
+-        if (connectParams->specType == VIXDISKLIB_SPEC_VMX) {
+-            if (connectParams->spec.vmxSpec) {
+-                free(connectParams->spec.vmxSpec);
+-            }
+-        } else if (connectParams->specType == VIXDISKLIB_SPEC_VSTORAGE_OBJECT) {
+-            if (connectParams->spec.vStorageObjectSpec.id) {
+-                free(connectParams->spec.vStorageObjectSpec.id);
+-            }
+-            if (connectParams->spec.vStorageObjectSpec.datastoreMoRef) {
+-                free(connectParams->spec.vStorageObjectSpec.datastoreMoRef);
+-            }
+-            if (connectParams->spec.vStorageObjectSpec.snapshotId) {
+-                free(connectParams->spec.vStorageObjectSpec.snapshotId);
+-            }
+-        }
+-        free(connectParams);
+-    }
+-    return VIX_OK;
++    free(connectParams);
+ }
+ 
+ VixError VixDiskLib_Open(const VixDiskLibConnection connection, const char *path, uint32_t flags,
+@@ -612,8 +571,13 @@ VixError VixDiskLib_ReadAsync(VixDiskLibHandle diskHandle, VixDiskLibSectorType
+         return VIX_E_DISK_NOT_INITIALIZED;
+     }
+ 
+-    return AsyncEngine_Submit(ctx->asyncEngine, ASYNC_OP_READ, diskHandle, startSector, numSectors, readBuffer, NULL,
+-                              callback, cbData);
++    /* Queued requests complete through the callback, and VMware's VDDK says
++     * so by returning VIX_ASYNC; callers such as nbdkit treat anything else
++     * as an immediate failure. Submit errors happen before queueing, so the
++     * callback is never invoked for them. */
++    VixError err = AsyncEngine_Submit(ctx->asyncEngine, ASYNC_OP_READ, diskHandle, startSector, numSectors,
++                                      readBuffer, NULL, callback, cbData);
++    return (err == VIX_OK) ? VIX_ASYNC : err;
+ }
+ 
+ VixError VixDiskLib_WriteAsync(VixDiskLibHandle diskHandle, VixDiskLibSectorType startSector,
+@@ -625,8 +589,13 @@ VixError VixDiskLib_WriteAsync(VixDiskLibHandle diskHandle, VixDiskLibSectorType
+         return VIX_E_DISK_NOT_INITIALIZED;
+     }
+ 
+-    return AsyncEngine_Submit(ctx->asyncEngine, ASYNC_OP_WRITE, diskHandle, startSector, numSectors, NULL, writeBuffer,
+-                              callback, cbData);
++    /* Queued requests complete through the callback, and VMware's VDDK says
++     * so by returning VIX_ASYNC; callers such as nbdkit treat anything else
++     * as an immediate failure. Submit errors happen before queueing, so the
++     * callback is never invoked for them. */
++    VixError err = AsyncEngine_Submit(ctx->asyncEngine, ASYNC_OP_WRITE, diskHandle, startSector, numSectors,
++                                      NULL, writeBuffer, callback, cbData);
++    return (err == VIX_OK) ? VIX_ASYNC : err;
+ }
+ 
+ VixError VixDiskLib_Wait(VixDiskLibHandle diskHandle)
+@@ -648,7 +617,16 @@ VixError VixDiskLib_GetInfo(VixDiskLibHandle diskHandle, VixDiskLibDiskInfo **in
+     }
+ 
+     if ((handle->ops != NULL) && (handle->ops->get_info != NULL)) {
+-        return handle->ops->get_info(handle, info);
++        err = handle->ops->get_info(handle, info);
++        if ((err == VIX_OK) && (info != NULL) && (*info != NULL)) {
++            if ((*info)->logicalSectorSize == 0U) {
++                (*info)->logicalSectorSize = VIXDISKLIB_SECTOR_SIZE;
++            }
++            if ((*info)->physicalSectorSize == 0U) {
++                (*info)->physicalSectorSize = VIXDISKLIB_SECTOR_SIZE;
++            }
++        }
++        return err;
+     }
+ 
+     return VIX_E_DISK_NOT_SUPPORTED;
+@@ -660,6 +638,9 @@ void VixDiskLib_FreeInfo(VixDiskLibDiskInfo *info)
+         if (info->parentFileNameHint != NULL) {
+             free(info->parentFileNameHint);
+         }
++        if (info->uuid != NULL) {
++            free(info->uuid);
++        }
+         free(info);
+     }
+ }
+diff --git a/tests/test_async_io.c b/tests/test_async_io.c
+index 0eaa6b0..37bc840 100644
+--- a/tests/test_async_io.c
++++ b/tests/test_async_io.c
+@@ -63,7 +63,7 @@ int main(void)
+         (void)memset(writeBuf[i], 0x30 + i, sizeof(writeBuf[i]));
+         err = VixDiskLib_WriteAsync(handle, (uint64_t)(i * 8), 8ULL, writeBuf[i], TestAsyncCompletion,
+                                     (void *)(intptr_t)i);
+-        assert(err == VIX_OK);
++        assert(err == VIX_ASYNC);
+     }
+ 
+     /* Wait for all async writes to complete */
+@@ -81,7 +81,7 @@ int main(void)
+         (void)memset(readBuf[i], 0, sizeof(readBuf[i]));
+         err =
+             VixDiskLib_ReadAsync(handle, (uint64_t)(i * 8), 8ULL, readBuf[i], TestAsyncCompletion, (void *)(intptr_t)i);
+-        assert(err == VIX_OK);
++        assert(err == VIX_ASYNC);
+     }
+ 
+     err = VixDiskLib_Wait(handle);
