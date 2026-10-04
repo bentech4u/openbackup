@@ -501,9 +501,16 @@ function NamespacePoint({ point: p }: { point: NamespacePointDetail }) {
         }
         actions={
           can("operator") && (
-            <Button variant="primary" onClick={() => setRestoring(true)}>
-              <RotateCcw size={15} /> Restore namespace…
-            </Button>
+            <>
+              {p.pvcs.some((v) => v.data) && (
+                <Button onClick={() => nav(`/points/${p.id}/files`)}>
+                  <FolderOpen size={15} /> Browse volume files
+                </Button>
+              )}
+              <Button variant="primary" onClick={() => setRestoring(true)}>
+                <RotateCcw size={15} /> Restore namespace…
+              </Button>
+            </>
           )
         }
       />

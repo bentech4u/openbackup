@@ -99,6 +99,12 @@ def sync_points(repository_id: int, repo: Repository) -> int:
 # ---------------------------------------------------------------------- backup
 
 
+def fcd_factory(source):
+    from ..vsphere.fcd import FcdManager
+
+    return FcdManager(source)
+
+
 def kube_client_factory(api_url: str, token: str, ca_pem: str):
     from ..kube.client import KubeClient
 
@@ -194,7 +200,9 @@ def _gc_if_needed(ctx, repo: Repository) -> None:
 
 def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskState, str]:
     from ..auth.secrets import decrypt
+    from ..engine.backup import latest_point_for_vm
     from ..kube.engine import NamespaceBackupOptions, backup_namespace, subject_id
+    from ..kube.volumes import volume_backup
 
     with session_scope() as db:
         cluster = db.get(KubeCluster, job.cluster_id) if job.cluster_id else None
@@ -212,6 +220,14 @@ def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskSt
     ok, failed, warned = [], [], []
     kube = kube_client_factory(cluster.api_url, decrypt(cluster.backup_token_enc),
                                cluster.ca_pem)
+    source = fcd = None
+    if vc is not None:
+        source = source_factory(vc)
+        source.connect()
+        fcd = fcd_factory(source)
+    else:
+        ctx.log(f"{cluster.name} has no vCenter configured: volume data is not backed up, "
+                "only volume claims", "warning")
     try:
         with services.open_repository(repo_row) as repo:
             for i, ns in enumerate(wanted):
@@ -221,8 +237,16 @@ def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskSt
                 scoped = ScopedContext(ctx, i, len(wanted), 0)
                 opts = NamespaceBackupOptions(cluster.id, cluster.name, cluster.api_url,
                                               job.id, job.name, task_id)
+                prev = latest_point_for_vm(repo, subject_id(cluster.name, ns))
+                freeze = job.selection.get("freeze_vms", True)
+                volumes = volume_backup(
+                    fcd, source._flat_disk if source is not None else None, prev,
+                    lambda k, p=prev: repo.load_map(p["id"], k), scoped, f"{cluster.name}/{ns}",
+                    active_full=bool(task.params.get("active_full")),
+                    freeze=(lambda vm, n=ns: kube.freeze_vm(n, vm)) if freeze else None,
+                    unfreeze=lambda vm, n=ns: kube.unfreeze_vm(n, vm), task_id=task_id)
                 try:
-                    manifest = backup_namespace(kube, repo, ns, opts, scoped)
+                    manifest = backup_namespace(kube, repo, ns, opts, scoped, volumes=volumes)
                 except Cancelled:
                     ctx.item(ns, state="cancelled")
                     raise
@@ -241,6 +265,8 @@ def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskSt
             _gc_if_needed(ctx, repo)
     finally:
         kube.close()
+        if source is not None:
+            source.close()
     with session_scope() as db:
         j = db.get(Job, job.id)
         if j:

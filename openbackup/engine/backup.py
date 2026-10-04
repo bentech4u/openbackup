@@ -8,9 +8,11 @@ full read costs time; a wrong incremental costs the data.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 from ..repo.blockmap import BlockMap
 from ..repo.repository import Repository, new_point_id
@@ -140,21 +142,24 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
         plans = []
         for d in disks:
             check_cancel(ctx)
-            m, extents, mode = _plan_disk(source, repo, vm, snap, d, prev, active_full, ctx,
-                                          name, warn)
+            src = VmDisk(source, vm, snap, vm_moref, sref.moref, d)
+            prev_disk = None
+            if prev is not None and not active_full:
+                prev_disk = next((p for p in prev.get("disks", []) if p["key"] == d.key), None)
+            m, extents, mode = plan_disk(
+                src, prev_disk, lambda k=src.key: repo.load_map(prev["id"], k), ctx, name, warn)
             blocks = blocks_for_extents(extents, m.block_size, d.capacity)
-            plans.append((d, m, mode, blocks, sum(m.block_length(i) for i in blocks)))
-        ctx.progress(0.0, total=sum(p[4] for p in plans))
+            plans.append((d, src, m, mode, blocks, sum(m.block_length(i) for i in blocks)))
+        ctx.progress(0.0, total=sum(p[5] for p in plans))
 
-        for d, m, mode, blocks, to_read in plans:
+        for d, src, m, mode, blocks, to_read in plans:
             check_cancel(ctx)
             any_full = any_full or mode != "incremental"
             item = f"{name} / {d.label}"
             ctx.item(item, vm=name, disk=d.label, mode=mode, capacity=d.capacity,
                      to_read=to_read, read=0, state="running")
             ctx.log(f"{name}: {d.label} {mode}, reading {human(to_read)} of {human(d.capacity)}")
-            read = _copy_blocks(source, vm_moref, sref.moref, d, m, blocks, writer, ctx,
-                                item, opts.read_depth)
+            read = copy_blocks(src, m, blocks, writer, ctx, item, opts.read_depth)
             ctx.item(item, read=read, state="done")
             maps[str(d.key)] = m
             totals["logical"] += d.capacity
@@ -199,43 +204,76 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
     return BackupResult(point_id, manifest, warnings)
 
 
-def _plan_disk(source, repo, vm, snap, d: DiskInfo, prev, active_full, ctx, name, warn
-               ) -> tuple[BlockMap, list[Extent], str]:
-    prev_disk = None
-    if prev is not None and not active_full:
-        prev_disk = next((p for p in prev.get("disks", []) if p["key"] == d.key), None)
-    whole = [Extent(0, d.capacity)]
+class DiskSource(Protocol):
+    """One disk to back up, wherever it comes from (a VM disk under a VM
+    snapshot, a First Class Disk under an FCD snapshot...)."""
 
+    key: str
+    label: str
+    capacity: int
+
+    def changed_areas(self, change_id: str) -> list[Extent]:
+        """Changed extents since ``change_id``; "*" means all allocated areas.
+        Raises VSphereError (or OSError) when the answer cannot be had."""
+
+    def allocated_extents(self) -> list[tuple[int, int]] | None:
+        """Allocated regions from the storage itself, or None if unknown."""
+
+    def open(self) -> AbstractContextManager[Any]:
+        """A reader with ``size``, ``pread_many`` and optionally ``description``."""
+
+
+class VmDisk:
+    """A VM disk, read under the VM's backup snapshot."""
+
+    def __init__(self, source, vm, snap, vm_moref: str, snap_moref: str, d: DiskInfo):
+        self.source, self.vm, self.snap = source, vm, snap
+        self.vm_moref, self.snap_moref, self.d = vm_moref, snap_moref, d
+        self.key, self.label, self.capacity = str(d.key), d.label, d.capacity
+
+    def changed_areas(self, change_id: str) -> list[Extent]:
+        return self.source.changed_areas(self.vm, self.snap, self.d, change_id)
+
+    def allocated_extents(self) -> list[tuple[int, int]] | None:
+        alloc = getattr(self.source, "allocated_extents", None)
+        return alloc(self.d) if alloc is not None else None
+
+    def open(self):
+        return self.source.open_disk(self.vm_moref, self.d, snapshot_moref=self.snap_moref)
+
+
+def plan_disk(src: DiskSource, prev_disk: dict | None, load_prev_map: Callable[[], BlockMap],
+              ctx: TaskContext, name: str, warn: Callable[[str], None]
+              ) -> tuple[BlockMap, list[Extent], str]:
+    """What to read from ``src``: CBT changes on top of the previous block map
+    when that can be trusted, otherwise everything allocated."""
     if prev_disk is not None:
         reason = None
-        if prev_disk["capacity"] != d.capacity:
+        if prev_disk["capacity"] != src.capacity:
             reason = "disk was resized"
         elif not prev_disk.get("change_id"):
             reason = "previous backup has no change id"
         if reason is None:
             try:
-                extents = source.changed_areas(vm, snap, d, prev_disk["change_id"])
-                return repo.load_map(prev["id"], str(d.key)).copy(), extents, "incremental"
+                extents = src.changed_areas(prev_disk["change_id"])
+                return load_prev_map().copy(), extents, "incremental"
             except (VSphereError, OSError) as e:
                 reason = f"CBT could not be used ({e})"
-        warn(f"{d.label}: {reason}; reading the full disk")
+        warn(f"{src.label}: {reason}; reading the full disk")
 
-    alloc = getattr(source, "allocated_extents", None)
-    if alloc is not None:
-        found = alloc(d)
-        if found is not None:
-            return BlockMap(d.capacity), [Extent(o, n) for o, n in found], "full"
+    found = src.allocated_extents()
+    if found is not None:
+        return BlockMap(src.capacity), [Extent(o, n) for o, n in found], "full"
     try:
-        extents = source.changed_areas(vm, snap, d, "*")
-        return BlockMap(d.capacity), extents, "full"
+        return BlockMap(src.capacity), src.changed_areas("*"), "full"
     except VSphereError as e:
-        ctx.log(f"{name}: {d.label}: allocation query unavailable ({e}); reading every block",
+        ctx.log(f"{name}: {src.label}: allocation query unavailable ({e}); reading every block",
                 "warning")
-        return BlockMap(d.capacity), whole, "full"
+        return BlockMap(src.capacity), [Extent(0, src.capacity)], "full"
 
 
-def _copy_blocks(source, vm_moref: str, snap_moref: str, d: DiskInfo, m: BlockMap,
-                 blocks: list[int], writer, ctx: TaskContext, item: str, depth: int) -> int:
+def copy_blocks(src: DiskSource, m: BlockMap, blocks: list[int], writer, ctx: TaskContext,
+                item: str, depth: int = 8) -> int:
     # The disk is opened even when no blocks changed: opening is what checks
     # its size and, for direct NFS, that it is a current base disk.
     read = reported_read = 0
@@ -248,14 +286,14 @@ def _copy_blocks(source, vm_moref: str, snap_moref: str, d: DiskInfo, m: BlockMa
         reported_read, reported_new = read, writer.new_bytes
         ctx.item(item, read=read)
 
-    with source.open_disk(vm_moref, d, snapshot_moref=snap_moref) as nbd:
-        if getattr(nbd, "description", ""):
-            ctx.log(f"{item}: reading via {nbd.description}")
-        if nbd.size != d.capacity:
-            raise BackupError(f"{d.label}: disk source is {nbd.size} bytes, vSphere reports "
-                              f"{d.capacity}")
+    with src.open() as reader:
+        if getattr(reader, "description", ""):
+            ctx.log(f"{item}: reading via {reader.description}")
+        if reader.size != src.capacity:
+            raise BackupError(f"{src.label}: disk source is {reader.size} bytes, vSphere "
+                              f"reports {src.capacity}")
         reqs = ((i * m.block_size, m.block_length(i)) for i in blocks)
-        for i, data in zip(blocks, nbd.pread_many(reqs, depth=depth), strict=True):
+        for i, data in zip(blocks, reader.pread_many(reqs, depth=depth), strict=True):
             m.ids[i] = writer.put(data)
             read += len(data)
             if time.monotonic() - last_report > 2:

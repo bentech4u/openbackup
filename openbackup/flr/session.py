@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -72,10 +73,13 @@ class FlrSession:
                 stderr=open(self._dir / "helper.log", "wb"), text=True, env=env, cwd=self._dir)
             # Disks in the order the VM had them, so guest device names
             # (sda, sdb...) and OS inspection match the original.
-            keys = [str(d["key"]) for d in sorted(
-                manifest.get("disks", []), key=lambda d: (d.get("controller_key", 0),
-                                                          d.get("unit_number", 0)))]
-            keys = keys or manifest["disk_keys"]
+            disks = sorted(manifest.get("disks", []),
+                           key=lambda d: (d.get("controller_key", 0), d.get("unit_number", 0)))
+            keys = [str(d["key"]) for d in disks]
+            labels = [d.get("label", "") for d in disks]
+            if not keys:
+                keys = [k for k in manifest["disk_keys"] if not k.startswith("__")]
+                labels = keys
             res = self._call("open", {"drives": [{"socket": str(server.socket_path),
                                                   "export": k} for k in keys]},
                              timeout=self.OPEN_TIMEOUT)
@@ -83,6 +87,12 @@ class FlrSession:
             self.close()
             raise
         self.volumes, self.os = res["volumes"], res["os"]
+        # Name each filesystem after the disk it is on (for OpenShift volumes,
+        # the claim name): /dev/sdb2 is on the second disk added.
+        for v in self.volumes:
+            m = re.match(r"/dev/[sv]d([a-z])", v["device"])
+            if m and ord(m.group(1)) - ord("a") < len(labels):
+                v["disk"] = labels[ord(m.group(1)) - ord("a")]
         return self
 
     def close(self) -> None:

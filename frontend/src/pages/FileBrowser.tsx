@@ -9,6 +9,7 @@ import { bytes, dateTime } from "../format";
 
 interface Volume {
   id: string;
+  disk?: string;
   device: string;
   fstype: string;
   guest_path: string | null;
@@ -34,6 +35,7 @@ interface Browse {
 
 function volumeTitle(v: Volume) {
   if (v.guest_path) return v.guest_path;
+  if (v.disk && !v.disk.startsWith("Hard disk")) return v.label ? `${v.disk} (${v.label})` : v.disk;
   return v.label || v.device.replace("/dev/", "");
 }
 
@@ -143,9 +145,11 @@ export default function FileBrowser() {
             >
               <Download size={15} /> Download
             </Button>
-            <Button variant="primary" disabled={selected.size === 0 || !can("operator")} onClick={() => setRestoring(true)}>
-              <RotateCcw size={15} /> Restore to VM…
-            </Button>
+            {p?.subject_kind !== "namespace" && (
+              <Button variant="primary" disabled={selected.size === 0 || !can("operator")} onClick={() => setRestoring(true)}>
+                <RotateCcw size={15} /> Restore to VM…
+              </Button>
+            )}
           </>
         }
       />

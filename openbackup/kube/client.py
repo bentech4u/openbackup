@@ -185,6 +185,18 @@ class KubeClient:
     def has_group(self, group: str) -> bool:
         return any(r.group == group for r in self.resources())
 
+    # --------------------------------------------------------------- kubevirt
+
+    def freeze_vm(self, namespace: str, name: str, timeout: str = "5m") -> None:
+        """Freeze a running VM's guest filesystems via the QEMU guest agent. It
+        thaws by itself after ``timeout`` even if unfreeze never arrives."""
+        self.put(f"/apis/subresources.kubevirt.io/v1/namespaces/{namespace}/"
+                 f"virtualmachineinstances/{name}/freeze", {"unfreezeTimeout": timeout})
+
+    def unfreeze_vm(self, namespace: str, name: str) -> None:
+        self.put(f"/apis/subresources.kubevirt.io/v1/namespaces/{namespace}/"
+                 f"virtualmachineinstances/{name}/unfreeze")
+
     # -------------------------------------------------------------- identity
 
     def whoami(self) -> str:

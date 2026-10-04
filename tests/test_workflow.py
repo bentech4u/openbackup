@@ -349,7 +349,10 @@ def test_openshift_namespace_backup_and_restore(admin_api, setup, make_user, log
     tid = admin_api.post(f"/api/jobs/{job['id']}/run").json()["id"]
     run_worker_until_idle()
     t = admin_api.get(f"/api/tasks/{tid}").json()
-    assert t["state"] == "success", t
+    # The cluster has no vCenter, so the vSphere volume's data is skipped, with a warning.
+    assert t["state"] == "warning", t
+    logs = " ".join(e["message"] for e in admin_api.get(f"/api/tasks/{tid}/logs").json())
+    assert "no vCenter configured" in logs
     point = next(p for p in admin_api.get("/api/points").json()
                  if p["subject_kind"] == "namespace")
     assert point["vm_name"] == "homelab/shop"
