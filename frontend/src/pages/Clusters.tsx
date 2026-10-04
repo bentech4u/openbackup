@@ -104,10 +104,8 @@ export default function Clusters() {
                 <tr>
                   <th>Name</th>
                   <th>API</th>
-                  <th>Trusted CA</th>
                   <th>Volume data via</th>
                   <th>Restore credential</th>
-                  <th />
                 </tr>
               </thead>
               <tbody>
@@ -117,19 +115,8 @@ export default function Clusters() {
                       <strong>{c.name}</strong>
                     </td>
                     <td className="mono small">{c.api_url}</td>
-                    <td className="small">{c.ca_subjects.join(", ")}</td>
                     <td>{c.vcenter_name ? <Badge tone="good">{c.vcenter_name}</Badge> : <Badge tone="warn">not linked</Badge>}</td>
                     <td>{c.has_restore_token ? <Badge tone="info">stored</Badge> : <Badge>asked per restore</Badge>}</td>
-                    <td className="right">
-                      {can("admin") && (
-                        <span className="row gap-s" style={{ justifyContent: "flex-end" }}>
-                          <Button onClick={(e) => { e.stopPropagation(); setPermissions(c); }}>Update permissions</Button>
-                          <Button variant="ghost" onClick={(e) => { e.stopPropagation(); setRemoving(c); }}>
-                            Remove
-                          </Button>
-                        </span>
-                      )}
-                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -138,7 +125,12 @@ export default function Clusters() {
         )}
       </Card>
       {current && clusters.data && (
-        <VolumeData cluster={clusters.data.find((c) => c.id === current)!} onChanged={() => qc.invalidateQueries({ queryKey: ["clusters"] })} />
+        <ClusterPanel
+          cluster={clusters.data.find((c) => c.id === current)!}
+          onChanged={() => qc.invalidateQueries({ queryKey: ["clusters"] })}
+          onPermissions={(c) => setPermissions(c)}
+          onRemove={(c) => setRemoving(c)}
+        />
       )}
       {current && <Namespaces clusterId={current} />}
       {adding && (
@@ -528,24 +520,50 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
 }
 
 
-function VolumeData({ cluster, onChanged }: { cluster: Cluster; onChanged: () => void }) {
+function ClusterPanel({ cluster, onChanged, onPermissions, onRemove }: {
+  cluster: Cluster;
+  onChanged: () => void;
+  onPermissions: (c: Cluster) => void;
+  onRemove: (c: Cluster) => void;
+}) {
   const { can } = useAuth();
   const [editing, setEditing] = useState(false);
   return (
     <Card
-      title="Persistent volume data"
-      actions={can("admin") && <Button onClick={() => setEditing(true)}>{cluster.vcenter_name ? "Change" : "Link vCenter"}</Button>}
+      title={cluster.name}
+      actions={
+        can("admin") && (
+          <>
+            <Button onClick={() => onPermissions(cluster)}>Update permissions</Button>
+            <Button onClick={() => setEditing(true)}>{cluster.vcenter_name ? "Change vCenter" : "Link vCenter"}</Button>
+            <Button variant="ghost" onClick={() => onRemove(cluster)}>
+              Remove
+            </Button>
+          </>
+        )
+      }
     >
-      {cluster.vcenter_name ? (
-        <div>
-          Volumes on vSphere CSI are backed up through vCenter <strong>{cluster.vcenter_name}</strong> (snapshots only; the data is read
-          from the datastore directly). Configure direct NFS for their datastore on the vCenters page.
-        </div>
-      ) : (
-        <Alert tone="warn">
-          No vCenter is linked, so only volume claims are backed up, not their data. Link the vCenter this cluster runs on.
-        </Alert>
-      )}
+      <div className="stack">
+        <dl className="kv">
+          <dt>API</dt>
+          <dd className="mono small">{cluster.api_url}</dd>
+          <dt>Trusted CA</dt>
+          <dd className="small">{cluster.ca_subjects.join(", ")}</dd>
+          <dt>Restore credential</dt>
+          <dd>{cluster.has_restore_token ? "stored" : "asked for each restore"}</dd>
+          <dt>Volume data</dt>
+          <dd>
+            {cluster.vcenter_name ? (
+              <>
+                through vCenter <strong>{cluster.vcenter_name}</strong>: snapshots only; the data is read from the datastore directly
+                (configure direct NFS for it on the vCenters page)
+              </>
+            ) : (
+              <span style={{ color: "var(--warn)" }}>no vCenter linked: only volume claims are backed up, not their data</span>
+            )}
+          </dd>
+        </dl>
+      </div>
       {editing && (
         <LinkVCenter
           cluster={cluster}
