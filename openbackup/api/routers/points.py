@@ -140,6 +140,48 @@ def verify(point_id: str, request: Request, db: Session = Depends(get_db),
     return t
 
 
+class BulkDeleteIn(BaseModel):
+    """Either explicit points, or every point of one VM / namespace / etcd set."""
+
+    point_ids: list[str] = Field(default_factory=list, max_length=5000)
+    vm_uuid: str | None = Field(None, max_length=255)
+
+
+@router.post("/delete", response_model=list[TaskOut], status_code=202)
+def delete_points(body: BulkDeleteIn, request: Request, db: Session = Depends(get_db),
+                  pr: Principal = Depends(admin)):
+    """Delete many restore points. Jobs are left alone; their next run starts
+    a new chain with a full backup if nothing is left to build on."""
+    q = select(RestorePoint)
+    if body.vm_uuid:
+        q = q.where(RestorePoint.vm_uuid == body.vm_uuid)
+    elif body.point_ids:
+        q = q.where(RestorePoint.id.in_(body.point_ids))
+    else:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Choose restore points to delete")
+    points = list(db.scalars(q))
+    if not points:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No matching restore points")
+    if body.point_ids and not body.vm_uuid and len(points) != len(set(body.point_ids)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Some restore points no longer exist")
+    by_repo: dict[int, list[RestorePoint]] = {}
+    for p in points:
+        by_repo.setdefault(p.repository_id, []).append(p)
+    tasks = []
+    for repo_id, pts in by_repo.items():
+        names = sorted({p.vm_name for p in pts})
+        t = Task(kind=TaskKind.gc, repository_id=repo_id, requested_by=pr.user.username,
+                 title=f"Delete {len(pts)} restore point(s) of {', '.join(names)[:150]}",
+                 params={"delete_points": [p.id for p in pts]})
+        db.add(t)
+        tasks.append(t)
+    db.flush()
+    audit(db, request, "point.delete", principal=pr,
+          target=", ".join(sorted({p.vm_name for p in points}))[:255],
+          detail={"points": len(points), "all_of_subject": bool(body.vm_uuid)})
+    return tasks
+
+
 @router.delete("/{point_id}", response_model=TaskOut, status_code=202)
 def delete_point(point_id: str, request: Request, db: Session = Depends(get_db),
                  pr: Principal = Depends(admin)):

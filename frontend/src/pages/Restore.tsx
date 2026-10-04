@@ -69,12 +69,59 @@ export default function Restore() {
 
 function PointList({ vm }: { vm: ProtectedVm }) {
   const nav = useNavigate();
+  const { can } = useAuth();
   const points = useQuery({
     queryKey: ["points", vm.vm_uuid],
     queryFn: () => get<RestorePoint[]>(`/api/points?vm_uuid=${encodeURIComponent(vm.vm_uuid)}`),
   });
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirm, setConfirm] = useState<"selected" | "all" | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const admin = can("admin");
+
+  async function remove() {
+    setBusy(true);
+    setError("");
+    try {
+      const tasks = await post<Task[]>(
+        "/api/points/delete",
+        confirm === "all" ? { vm_uuid: vm.vm_uuid } : { point_ids: [...selected] },
+      );
+      nav(`/tasks/${tasks[0].id}`);
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(false);
+      setConfirm(null);
+    }
+  }
+
+  const toggle = (id: string) =>
+    setSelected((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+
   return (
-    <Card title={`Restore points of ${vm.vm_name}`} pad={false}>
+    <Card
+      title={`Restore points of ${vm.vm_name}`}
+      pad={false}
+      actions={
+        admin && (
+          <>
+            <Button disabled={selected.size === 0} onClick={() => setConfirm("selected")}>
+              <Trash2 size={14} /> Delete selected
+            </Button>
+            <Button variant="ghost" onClick={() => setConfirm("all")}>
+              Delete all
+            </Button>
+          </>
+        )
+      }
+    >
+      <Alert>{error}</Alert>
       {points.isLoading ? (
         <Loading />
       ) : (
@@ -82,6 +129,7 @@ function PointList({ vm }: { vm: ProtectedVm }) {
           <table>
             <thead>
               <tr>
+                {admin && <th style={{ width: 32 }} />}
                 <th>Created</th>
                 <th>Type</th>
                 <th>Read</th>
@@ -90,7 +138,12 @@ function PointList({ vm }: { vm: ProtectedVm }) {
             </thead>
             <tbody>
               {points.data?.map((p) => (
-                <tr key={p.id} className="clickable" onClick={() => nav(`/points/${p.id}`)}>
+                <tr key={p.id} className={`clickable ${selected.has(p.id) ? "selected" : ""}`} onClick={() => nav(`/points/${p.id}`)}>
+                  {admin && (
+                    <td onClick={(e) => e.stopPropagation()}>
+                      <input type="checkbox" checked={selected.has(p.id)} onChange={() => toggle(p.id)} />
+                    </td>
+                  )}
                   <td>
                     <div>{dateTime(p.created_at)}</div>
                     <div className="muted small">{relative(p.created_at)}</div>
@@ -105,6 +158,30 @@ function PointList({ vm }: { vm: ProtectedVm }) {
             </tbody>
           </table>
         </div>
+      )}
+      {confirm && (
+        <Confirm
+          title={confirm === "all" ? `Delete all backups of ${vm.vm_name}?` : `Delete ${selected.size} restore point(s)?`}
+          message={
+            <div className="stack">
+              <div>
+                {confirm === "all"
+                  ? `All ${points.data?.length ?? vm.points} restore points of ${vm.vm_name} are removed from the repository and the space only they used is reclaimed.`
+                  : "The selected restore points are removed from the repository and the space only they used is reclaimed."}{" "}
+                This cannot be undone.
+              </div>
+              <div className="muted small">
+                Backup jobs are not changed. If every point is deleted, the job's next run makes a new full backup.
+              </div>
+            </div>
+          }
+          confirmLabel="Delete"
+          danger
+          requireText={confirm === "all" ? vm.vm_name : undefined}
+          busy={busy}
+          onConfirm={remove}
+          onClose={() => setConfirm(null)}
+        />
       )}
     </Card>
   );

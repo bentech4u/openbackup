@@ -456,3 +456,44 @@ def test_namespace_restore_fills_volumes_through_mover_pods(admin_api, setup, cl
     pods = [k for k in dr.objects if k[1] == "pods"]
     assert pods == []  # mover pods are cleaned up
     get_settings.cache_clear()
+
+
+def test_delete_all_backups_of_a_vm_keeps_the_job(admin_api, setup, make_user, login):
+    job_id = setup["job_id"]
+    for _ in range(2):
+        admin_api.post(f"/api/jobs/{job_id}/run")
+        run_worker_until_idle()
+    points = admin_api.get("/api/points").json()
+    assert len(points) == 2
+    uuid = points[0]["vm_uuid"]
+
+    make_user("op", "operator")
+    op = login("op")
+    assert op.post("/api/points/delete", json={"vm_uuid": uuid}).status_code == 403
+    admin = login("admin")
+    assert admin.post("/api/points/delete", json={}).status_code == 400
+
+    r = admin.post("/api/points/delete", json={"vm_uuid": uuid})
+    assert r.status_code == 202 and len(r.json()) == 1
+    run_worker_until_idle()
+    assert admin.get(f"/api/tasks/{r.json()[0]['id']}").json()["state"] == "success"
+    assert admin.get("/api/points").json() == []
+    # The job is still there, and its next run is a fresh full backup.
+    assert admin.get(f"/api/jobs/{job_id}").status_code == 200
+    admin.post(f"/api/jobs/{job_id}/run")
+    run_worker_until_idle()
+    (p,) = admin.get("/api/points").json()
+    assert p["kind"] == "full"
+
+
+def test_delete_selected_points(admin_api, setup):
+    for _ in range(2):
+        admin_api.post(f"/api/jobs/{setup['job_id']}/run")
+        run_worker_until_idle()
+    older, newer = sorted(admin_api.get("/api/points").json(), key=lambda p: p["created_at"])
+    r = admin_api.post("/api/points/delete", json={"point_ids": [older["id"]]})
+    assert r.status_code == 202
+    run_worker_until_idle()
+    assert [p["id"] for p in admin_api.get("/api/points").json()] == [newer["id"]]
+    r = admin_api.post("/api/points/delete", json={"point_ids": ["nope"]})
+    assert r.status_code == 404
