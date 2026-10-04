@@ -278,3 +278,51 @@ def test_failed_consolidation_after_snapshot_removal_is_retried(env, monkeypatch
     vs.consolidation_failures[vm.moref] = 99
     r = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
     assert any("Consolidate" in w for w in r.warnings)
+
+
+def test_in_place_quick_rollback_writes_only_what_changed(env):
+    vs, repo, _ = env
+    vm = vs.add_vm("roll1", [16 * MiB])
+    vm.cbt = True
+    vs.write(vm, 2000, 0, os.urandom(4 * MiB))
+    good = vs.read(vm, 2000)
+    r = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    vs.write(vm, 2000, MiB + 7, b"damage")  # one data block changed
+    vs.write(vm, 2000, 9 * MiB, b"ransom" * 100)  # one zero block written
+    ctx = NullContext()
+    restore_in_place(vs, repo, r.point_id, ctx)
+    assert vs.read(vm, 2000) == good
+    assert any("quick rollback, 2 changed block(s)" in m for _, m in ctx.messages)
+    assert any("2 MiB written back" in m for _, m in ctx.messages)
+    # CBT was reset, so the next backup cannot trust stale change IDs.
+    assert f"reset_cbt:{vm.moref}" in vs.calls
+    assert backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext()).manifest["kind"] == \
+        "full"
+
+
+def test_in_place_falls_back_to_comparing_every_block(env):
+    vs, repo, _ = env
+    vm = vs.add_vm("roll2", [8 * MiB])
+    vm.cbt = True
+    vs.write(vm, 2000, 0, os.urandom(3 * MiB))
+    good = vs.read(vm, 2000)
+    r = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    vs.write(vm, 2000, 2 * MiB, os.urandom(10))
+    vs.write(vm, 2000, 6 * MiB, b"x" * 100)
+    vs.reset_cbt(vm)  # e.g. storage vMotion: CBT can no longer answer
+    ctx = NullContext()
+    restore_in_place(vs, repo, r.point_id, ctx)
+    assert vs.read(vm, 2000) == good
+    assert any("comparing every block" in m for _, m in ctx.messages)
+    assert any("2 MiB written back" in m for _, m in ctx.messages)
+
+
+def test_new_vm_restore_needs_a_writable_datastore(env):
+    vs, repo, _ = env
+    vm = vs.add_vm("nw1", [2 * MiB])
+    r = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    vs.can_write = lambda ds: ds == "nfs-ds"
+    with pytest.raises(RestoreError, match="direct NFS"):
+        restore_new_vm(vs, repo, r.point_id, NewVmTarget(
+            name="x", folder="f", resource_pool="rp", datastore="vmfs-ds"), NullContext())
+    assert not any(v.name == "x" for v in vs.vms.values())  # nothing created

@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, FolderOpen, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
-import { del, get, post, type Placement, type PointDetail, type RestorePoint, type Task, type VCenter } from "../api";
+import { del, get, post, type Datastore, type Placement, type PointDetail, type RestorePoint, type Task, type VCenter } from "../api";
 import type { Cluster } from "./Clusters";
 import { useAuth } from "../auth";
 import { Alert, Badge, Button, Card, Confirm, Empty, Field, Loading, Modal, PageHeader, errorText } from "../components/ui";
@@ -344,6 +344,12 @@ function RestoreWizard({ point, onClose }: { point: PointDetail; onClose: () => 
     queryFn: () => get<Placement>(`/api/vcenters/${vcenterId}/placement`),
     enabled: !!vcenterId && mode === "new_vm",
   });
+  const dsAccess = useQuery({
+    queryKey: ["datastores", vcenterId],
+    queryFn: () => get<Datastore[]>(`/api/vcenters/${vcenterId}/datastores`),
+    enabled: !!vcenterId,
+  });
+  const writable = new Set((dsAccess.data ?? []).filter((d) => d.direct_nfs?.enabled).map((d) => d.name));
   const [name, setName] = useState(`${point.vm_name}-restored`);
   const [folder, setFolder] = useState("");
   const [pool, setPool] = useState("");
@@ -482,8 +488,8 @@ function RestoreWizard({ point, onClose }: { point: PointDetail; onClose: () => 
                       {pl.datastores
                         .filter((d) => d.accessible)
                         .map((d) => (
-                          <option key={d.moref} value={d.name}>
-                            {d.name} ({bytes(d.free)} free)
+                          <option key={d.moref} value={d.name} disabled={!writable.has(d.name)}>
+                            {d.name} ({bytes(d.free)} free){writable.has(d.name) ? "" : " — no direct NFS access"}
                           </option>
                         ))}
                     </select>
@@ -508,7 +514,8 @@ function RestoreWizard({ point, onClose }: { point: PointDetail; onClose: () => 
                   </Card>
                 )}
                 <Alert tone="info">
-                  The new VM gets new MAC addresses. If the original is still running, consider connecting the restored VM to an isolated
+                  Disks are written straight to the datastore over its direct NFS connection (vCenter only creates the VM), so only
+                  NFS datastores with direct access configured can be chosen. The new VM gets new MAC addresses. If the original is still running, consider connecting the restored VM to an isolated
                   network first.
                 </Alert>
                 <label className="check">
@@ -522,8 +529,10 @@ function RestoreWizard({ point, onClose }: { point: PointDetail; onClose: () => 
         {mode === "in_place" && (
           <>
             <Alert tone="warn">
-              <strong>{point.vm_name}</strong> will be powered off and every disk overwritten with the state from {dateTime(point.created_at)}.
-              Everything written since then is lost. The VM must have no snapshots and the same disk layout.
+              <strong>{point.vm_name}</strong> will be powered off and rolled back to its state from {dateTime(point.created_at)}.
+              Everything written since then is lost. Only blocks that changed since the backup are written back (found through CBT, or
+              by comparing every block), so this is usually quick. The VM must have no snapshots and the same disk layout, on an NFS
+              datastore with direct access. Its next backup will be a full one.
             </Alert>
             <Field label={`Type ${point.vm_name} to confirm`}>
               <input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} autoComplete="off" />

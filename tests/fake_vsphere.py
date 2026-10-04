@@ -177,10 +177,13 @@ class FakeVSphere:
         if epoch != vm.epoch:
             raise VSphereError("change id is not valid for this disk")
         since = int(gen)
+        # snap None: changes up to the disk's current state (VM powered off).
+        upto = snap.gen if snap is not None else vm.gen
         return [Extent(o, n) for g, k, o, n in vm.changes
-                if k == disk.key and since < g <= snap.gen]
+                if k == disk.key and since < g <= upto]
 
     def reset_cbt(self, vm: FakeVm) -> None:
+        self.calls.append(f"reset_cbt:{vm.moref}")
         vm.epoch = uuid.uuid4().hex[:6]
 
     @contextmanager

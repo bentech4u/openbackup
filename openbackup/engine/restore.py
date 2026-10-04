@@ -104,6 +104,12 @@ def restore_new_vm(source: Any, repo: Repository, point_id: str, target: NewVmTa
     backed_up = {d["key"] for d in manifest["disks"]}
     # Only recreate disks that were actually backed up.
     config["disks"] = [d for d in config["disks"] if d["key"] in backed_up]
+    can_write = getattr(source, "can_write", None)
+    if can_write is not None and not can_write(target.datastore):
+        raise RestoreError(
+            f"Datastore {target.datastore} has no direct NFS access configured, so the restored "
+            "disks cannot be written. Choose an NFS datastore that has it (vCenters page > "
+            "Datastores).")
     ctx.progress(0.0, total=sum(d["capacity"] for d in config["disks"]))
     ctx.log(f"Creating VM {target.name} on datastore {target.datastore}")
     moref, mapping = source.create_vm(
@@ -126,11 +132,16 @@ def restore_new_vm(source: Any, repo: Repository, point_id: str, target: NewVmTa
 
 def restore_in_place(source: Any, repo: Repository, point_id: str, ctx: TaskContext,
                      vm_moref: str | None = None, power_on: bool = False) -> None:
-    """Overwrite the disks of the original VM. The VM is powered off; its
-    disks must match the backup in number and size, and it must have no
-    snapshots (writing a base disk under a snapshot would corrupt it)."""
+    """Roll the original VM back to the restore point. The VM is powered off;
+    its disks must match the backup in number and size, and it must have no
+    snapshots (writing a base disk under a snapshot would corrupt it).
+
+    Quick rollback: CBT says which blocks changed since the backup, and only
+    those are written back. If CBT cannot answer, every block is compared and
+    only differing ones are written. Either way thin disks stay thin."""
     manifest = repo.load_manifest(point_id)
     moref = vm_moref or manifest["vm"]["moref"]
+    name = manifest["vm"]["name"]
     vm = source.get_vm(moref)
     current = {d.key: d for d in source.vm_disks(vm)}
     cfg = source.capture_config(vm)
@@ -143,18 +154,81 @@ def restore_in_place(source: Any, repo: Repository, point_id: str, ctx: TaskCont
         if cur is None or cur.capacity != d["capacity"]:
             raise RestoreError(f"Disk {d['label']} no longer matches the backup; "
                                "restore to a new VM instead")
+        can_write = getattr(source, "can_write", None)
+        if can_write is not None and not can_write(cur.datastore):
+            raise RestoreError(f"Datastore {cur.datastore} of {d['label']} has no direct NFS "
+                               "access configured, so the disk cannot be written")
     ctx.progress(0.0, total=sum(d["capacity"] for d in manifest["disks"]))
-    ctx.log(f"Powering off {manifest['vm']['name']}")
+    ctx.log(f"Powering off {name}")
     source.power_off(vm)
-    for d in manifest["disks"]:
-        check_cancel(ctx)
-        m = repo.load_map(point_id, str(d["key"]))
-        item = f"{manifest['vm']['name']} / {d['label']}"
-        ctx.item(item, disk=d["label"], capacity=m.capacity, written=0, state="running")
-        _write_disk(source, repo, moref, current[d["key"]], m, ctx, item, skip_zero=False)
+    try:
+        for d in manifest["disks"]:
+            check_cancel(ctx)
+            m = repo.load_map(point_id, str(d["key"]))
+            item = f"{name} / {d['label']}"
+            ctx.item(item, disk=d["label"], capacity=m.capacity, written=0, state="running")
+            _rollback_disk(source, repo, vm, moref, current[d["key"]], m, d, ctx, item)
+    finally:
+        # Our writes bypassed ESXi, so CBT did not see them; the change IDs the
+        # last backup recorded no longer describe the disk. Reset CBT so the
+        # next backup reads everything instead of trusting them.
+        try:
+            source.reset_cbt(vm)
+            ctx.log(f"{name}: Changed Block Tracking reset; its next backup will be a full")
+        except Exception as e:
+            ctx.log(f"{name}: could not reset Changed Block Tracking ({e}). Run its backup "
+                    "job with 'Run active full' next, or the next incremental will be wrong.",
+                    "error")
     if power_on:
         source.power_on(vm)
-    ctx.log(f"In-place restore of {manifest['vm']['name']} finished")
+    ctx.log(f"In-place restore of {name} finished")
+
+
+def _rollback_disk(source, repo: Repository, vm, moref: str, disk: DiskInfo, m: BlockMap,
+                   rec: dict, ctx: TaskContext, item: str) -> None:
+    from .backup import blocks_for_extents
+
+    blocks: list[int] | None = None
+    if rec.get("change_id"):
+        try:
+            extents = source.changed_areas(vm, None, disk, rec["change_id"])
+            blocks = blocks_for_extents(extents, m.block_size, m.capacity)
+            ctx.log(f"{item}: quick rollback, {len(blocks)} changed block(s) since the backup")
+        except Exception as e:
+            ctx.log(f"{item}: CBT cannot say what changed ({e}); comparing every block",
+                    "warning")
+    if blocks is None:
+        ctx.log(f"{item}: comparing all {m.block_count} block(s) with the backup")
+    prog = _Progress(ctx, item)
+    written = 0
+    with source.open_disk(moref, disk, write=True) as w:
+        if w.read_only:
+            raise RestoreError("disk was opened read-only")
+        for i in (blocks if blocks is not None else range(m.block_count)):
+            if i % 256 == 0:
+                check_cancel(ctx)
+            length = m.block_length(i)
+            off = i * m.block_size
+            cid = m.ids[i]
+            if blocks is None:  # compare mode: only write what differs
+                cur = w.pread(off, length)
+                if cid == ZERO_ID:
+                    if cur.count(0) == len(cur):
+                        prog.add(length)
+                        continue
+                elif repo.codec.chunk_id(cur) == cid:
+                    prog.add(length)
+                    continue
+            if cid == ZERO_ID:
+                w.write_zeroes(off, length)
+            else:
+                w.pwrite(off, repo.read_chunk(cid, length))
+            written += length
+            prog.add(length)
+        w.flush()
+    prog.flush()
+    ctx.item(item, state="done", rewritten=written)
+    ctx.log(f"{item}: {written / 2**20:.0f} MiB written back")
 
 
 def export_disks(repo: Repository, point_id: str, dest: Path, fmt: str, ctx: TaskContext

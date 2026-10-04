@@ -11,11 +11,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pyVmomi import vim
+
 from ..nbd.client import NbdClient, NbdError
 from ..nbd.nbdkit import Nbdkit, VddkTarget
 from ..repo import nfs
-from ..vsphere.client import VSphere
-from ..vsphere.nfsdirect import DirectNfsError, FlatDisk, datastore_relpath, resolve_base_flat
+from ..vsphere.client import VSphere, VSphereError
+from ..vsphere.nfsdirect import (
+    DirectNfsError,
+    FlatDisk,
+    FlatDiskWriter,
+    datastore_relpath,
+    resolve_base_flat,
+)
 from ..vsphere.types import DiskInfo
 
 
@@ -33,11 +41,12 @@ class DirectNfsAccess:
     export: str
     options: str = "nfsvers=3,hard"
 
-    def mountpoint(self, root: Path) -> Path:
+    def mountpoint(self, root: Path, writable: bool = False) -> Path:
         # Named after the address and options: changing them gives new tasks
-        # a fresh mount while running ones finish on the old one.
+        # a fresh mount while running ones finish on the old one. Restores get
+        # a separate, writable mount; backups never use it.
         h = hashlib.sha1(f"{self.server}|{self.export}|{self.options}".encode()).hexdigest()
-        return root / f"ds-{self.id}-{h[:8]}"
+        return root / f"{'dsw' if writable else 'ds'}-{self.id}-{h[:8]}"
 
 
 class VSphereSource(VSphere):
@@ -50,6 +59,7 @@ class VSphereSource(VSphere):
         self.transports = transports
         self.direct_nfs = {a.datastore: a for a in direct_nfs or []}
         self.mount_root = mount_root
+        self._rw_mounts: list[Path] = []
 
     def get_vm(self, moref: str) -> Any:
         return self.vm(moref)
@@ -71,6 +81,59 @@ class VSphereSource(VSphere):
         extents = resolve_base_flat(mp / datastore_relpath(disk.file))
         return FlatDisk(extents, f"direct NFS {access.server}:{access.export} (read-only)")
 
+    def can_write(self, datastore: str) -> bool:
+        """Whether restores can write to this datastore (direct NFS access)."""
+        return datastore in self.direct_nfs
+
+    def _writable_flat_disk(self, vm_moref: str, disk: DiskInfo) -> FlatDiskWriter:
+        """The disk files of ``vm_moref``, opened for writing, after checking
+        everything that makes that safe. Every write path goes through here."""
+        access = self.direct_nfs.get(disk.datastore)
+        if access is None:
+            raise VSphereError(
+                f"Datastore {disk.datastore} has no direct NFS access configured; whole-VM "
+                "restores can only write to NFS datastores OpenBackup can reach directly")
+        vm = self.vm(vm_moref)
+        if str(vm.runtime.powerState) != "poweredOff":
+            raise VSphereError(f"{vm.name} must be powered off before its disks are written")
+        if vm.snapshot is not None:
+            raise VSphereError(f"{vm.name} has snapshots; its base disks cannot be written")
+        own = {d.file for d in self.vm_disks(vm)}
+        if disk.file not in own:
+            raise VSphereError(f"{disk.file} is not one of {vm.name}'s disks")
+        mp = access.mountpoint(self.mount_root, writable=True)
+        try:
+            ours = nfs.ensure_mounted(access.server, access.export, mp, access.options)
+        except nfs.NfsError as e:
+            raise DirectNfsError(f"datastore {disk.datastore}: {e}") from None
+        if ours:
+            self._rw_mounts.append(mp)
+        writer = FlatDiskWriter(resolve_base_flat(mp / datastore_relpath(disk.file)),
+                                f"direct NFS {access.server}:{access.export} (writing)")
+        if writer.size != disk.capacity:
+            writer.close()
+            raise VSphereError(f"{disk.file} is {writer.size} bytes, vSphere reports "
+                               f"{disk.capacity}")
+        return writer
+
+    def reset_cbt(self, vm) -> None:
+        """Invalidate the VM's change IDs (CBT off, then on) so the next backup
+        reads everything. Needed after writing its disks directly, which CBT
+        does not see."""
+        for flag in (False, True):
+            self.wait(self.rebind(vm).ReconfigVM_Task(
+                vim.vm.ConfigSpec(changeTrackingEnabled=flag)), timeout=600)
+
+    def close(self) -> None:
+        for mp in self._rw_mounts:
+            try:
+                nfs.unmount(mp)
+                mp.rmdir()
+            except (nfs.NfsError, OSError):
+                pass
+        self._rw_mounts = []
+        super().close()
+
     def allocated_extents(self, disk: DiskInfo) -> list[tuple[int, int]] | None:
         """Allocated regions from the datastore filesystem, when it can tell."""
         fd = self._flat_disk(disk)
@@ -90,6 +153,10 @@ class VSphereSource(VSphere):
                 with flat:
                     yield flat
                 return
+        elif disk.datastore in self.direct_nfs:
+            with self._writable_flat_disk(vm_moref, disk) as w:
+                yield w
+            return
         target = VddkTarget(
             libdir=self.vddk_libdir, server=self.host, port=self.port, user=self.user,
             password=self._password, thumbprint=self.thumbprint, vm_moref=vm_moref,

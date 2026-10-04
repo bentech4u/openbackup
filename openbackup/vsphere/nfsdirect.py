@@ -202,3 +202,62 @@ class FlatDisk:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+class FlatDiskWriter(FlatDisk):
+    """Write access to the flat extents of a disk that the restore engine has
+    verified belongs to the VM being restored (see VSphereSource.open_disk).
+    Existing files only: nothing is created, truncated or removed."""
+
+    read_only = False
+
+    def __init__(self, extents: list[FlatExtent], description: str = ""):
+        self.extents = extents
+        self.size = sum(e.size for e in extents)
+        self.description = description
+        self._fds = []
+        try:
+            for e in extents:
+                self._fds.append(os.open(e.path, os.O_RDWR | os.O_CLOEXEC))
+        except BaseException:
+            self.close()
+            raise
+        self._starts = []
+        pos = 0
+        for e in extents:
+            self._starts.append(pos)
+            pos += e.size
+
+    def pwrite(self, offset: int, data: bytes) -> None:
+        if offset < 0 or offset + len(data) > self.size:
+            raise DirectNfsError(f"write {offset}+{len(data)} is outside the disk")
+        view = memoryview(data)
+        while view:
+            i = max(j for j, s in enumerate(self._starts) if s <= offset)
+            e, start = self.extents[i], self._starts[i]
+            within = offset - start
+            n = min(len(view), e.size - within)
+            written = os.pwrite(self._fds[i], view[:n], e.offset_sectors * SECTOR + within)
+            if written != n:
+                raise DirectNfsError(f"short write to {e.path.name} at {within}")
+            offset += n
+            view = view[n:]
+
+    def pwrite_many(self, writes, depth: int = 8) -> int:
+        total = 0
+        for off, data in writes:
+            self.pwrite(off, data)
+            total += len(data)
+        return total
+
+    def write_zeroes(self, offset: int, length: int) -> None:
+        chunk = bytes(1 << 20)
+        end = offset + length
+        while offset < end:
+            n = min(len(chunk), end - offset)
+            self.pwrite(offset, chunk[:n])
+            offset += n
+
+    def flush(self) -> None:
+        for fd in self._fds:
+            os.fsync(fd)
