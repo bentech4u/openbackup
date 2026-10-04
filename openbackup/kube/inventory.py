@@ -9,7 +9,9 @@ from .client import KubeClient, KubeError
 
 VSPHERE_CSI = "csi.vsphere.vmware.com"
 SYSTEM_PREFIXES = ("openshift", "kube-")
-SYSTEM_NAMES = {"default", "openshift", "kube-system", "kube-public", "kube-node-lease"}
+# "openbackup" holds only our own ServiceAccounts.
+SYSTEM_NAMES = {"default", "openshift", "kube-system", "kube-public", "kube-node-lease",
+                "openbackup"}
 
 
 def is_system_namespace(name: str) -> bool:

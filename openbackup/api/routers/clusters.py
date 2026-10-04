@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -12,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ...auth.secrets import decrypt, encrypt
 from ...db.models import Job, KubeCluster, VCenter
-from ...kube import inventory
+from ...kube import bootstrap, inventory
 from ...kube.client import KubeClient, KubeError, fetch_chain, validate_ca_bundle
 from ..deps import Principal, admin, audit, get_db, viewer
 
@@ -20,8 +22,9 @@ router = APIRouter(prefix="/api/clusters", tags=["clusters"])
 
 URL_PATTERN = r"^https://[A-Za-z0-9.\-\[\]:]+(:\d+)?/?$"
 
-# Tests replace this to talk to a fake API server.
+# Tests replace these to talk to fake servers.
 client_factory = KubeClient
+oauth_transport = None
 
 
 class ClusterOut(BaseModel):
@@ -97,6 +100,112 @@ async def fetch_ca(body: FetchCaIn, _: Principal = Depends(admin)) -> list[dict]
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
     return [{"pem": c.pem, "subject": c.subject, "issuer": c.issuer, "sha256": c.sha256,
              "is_ca": c.is_ca} for c in chain]
+
+
+class OAuthInfoIn(BaseModel):
+    api_url: str = Field(pattern=URL_PATTERN)
+    ca_pem: str = Field(min_length=1, max_length=65536)
+
+
+@router.post("/oauth-info")
+async def oauth_info(body: OAuthInfoIn, _: Principal = Depends(admin)) -> dict:
+    """Where password login happens, and the certificates it presents (the
+    OAuth server sits on the ingress, usually with a different CA)."""
+    def work():
+        validate_ca_bundle(body.ca_pem)
+        with client_factory(body.api_url.rstrip("/"), "", body.ca_pem) as c:
+            url = bootstrap.oauth_endpoint(c)
+        u = urlsplit(url)
+        chain = [] if oauth_transport is not None else fetch_chain(f"https://{u.netloc}")
+        return {"authorize_url": url, "chain": [
+            {"pem": x.pem, "subject": x.subject, "issuer": x.issuer, "sha256": x.sha256,
+             "is_ca": x.is_ca} for x in chain]}
+    try:
+        return await run_in_threadpool(work)
+    except KubeError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
+
+
+class AdminAuth(BaseModel):
+    kind: Literal["password", "token"]
+    username: str = Field("", max_length=255)
+    password: str = Field("", max_length=1024)
+    token: str = Field("", max_length=16384)
+    oauth_ca_pem: str = Field("", max_length=65536)
+
+
+class SetupIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    api_url: str = Field(pattern=URL_PATTERN)
+    ca_pem: str = Field(min_length=1, max_length=65536)
+    vcenter_id: int | None = None
+    admin: AdminAuth
+    # Create the restore account too, and keep its token in OpenBackup.
+    restore_account: bool = True
+
+
+def _setup(body: SetupIn) -> tuple[bootstrap.SetupResult, dict, dict | None]:
+    api_url = body.api_url.rstrip("/")
+    validate_ca_bundle(body.ca_pem)
+    a = body.admin
+    obtained = False
+    if a.kind == "password":
+        if not a.username or not a.password:
+            raise KubeError("Enter the admin username and password")
+        with client_factory(api_url, "", body.ca_pem) as anon:
+            url = bootstrap.oauth_endpoint(anon)
+        if oauth_transport is None:
+            validate_ca_bundle(a.oauth_ca_pem)
+        admin_token = bootstrap.password_login(url, a.username, a.password, a.oauth_ca_pem,
+                                               transport=oauth_transport)
+        obtained = True
+    else:
+        if not a.token:
+            raise KubeError("Paste an admin token")
+        admin_token = a.token.strip()
+    with client_factory(api_url, admin_token, body.ca_pem) as admin_client:
+        try:
+            result = bootstrap.setup_accounts(admin_client, body.restore_account)
+        finally:
+            if obtained:  # only the session we created; a pasted token stays the user's
+                try:
+                    bootstrap.revoke_session_token(admin_client, admin_token)
+                except KubeError:
+                    pass
+    backup = _probe(api_url, body.ca_pem, result.backup_token)
+    restore = (_probe(api_url, body.ca_pem, result.restore_token, False)
+               if result.restore_token else None)
+    return result, backup, restore
+
+
+@router.post("/setup", status_code=201)
+async def setup(body: SetupIn, request: Request, db: Session = Depends(get_db),
+                p: Principal = Depends(admin)) -> dict:
+    """Create OpenBackup's ServiceAccounts with admin credentials used once
+    and never stored, then register the cluster with those accounts."""
+    if db.scalar(select(KubeCluster).where(KubeCluster.name == body.name)):
+        raise HTTPException(status.HTTP_409_CONFLICT, "A cluster with that name exists")
+    if body.vcenter_id is not None and db.get(VCenter, body.vcenter_id) is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown vCenter")
+    try:
+        result, backup, restore = await run_in_threadpool(_setup, body)
+    except KubeError as e:
+        audit(db, request, "cluster.setup", principal=p, target=body.name, success=False,
+              detail={"api_url": body.api_url, "error": str(e)[:300]})
+        db.commit()
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e)) from None
+    c = KubeCluster(name=body.name, api_url=body.api_url.rstrip("/"), ca_pem=body.ca_pem,
+                    backup_token_enc=encrypt(result.backup_token),
+                    restore_token_enc=encrypt(result.restore_token) if result.restore_token
+                    else None, vcenter_id=body.vcenter_id)
+    db.add(c)
+    db.flush()
+    audit(db, request, "cluster.setup", principal=p, target=c.name,
+          detail={"api_url": c.api_url, "admin_user": result.admin_user,
+                  "login": body.admin.kind, "created": result.created})
+    return {"cluster": _out(c).model_dump(mode="json"), "backup": backup, "restore": restore,
+            "admin_user": result.admin_user, "created": result.created,
+            "skipped": result.skipped}
 
 
 @router.get("", response_model=list[ClusterOut])

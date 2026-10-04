@@ -55,14 +55,15 @@ class KubeClient:
     def __init__(self, api_url: str, token: str, ca_pem: str, timeout: float = 60,
                  transport: httpx.BaseTransport | None = None):
         self.api_url = api_url.rstrip("/")
+        # No token means an anonymous request (e.g. OAuth discovery).
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
         if transport is None:
             ctx = ssl.create_default_context(cadata=ca_pem)
             self._http = httpx.Client(base_url=self.api_url, verify=ctx, timeout=timeout,
-                                      headers={"Authorization": f"Bearer {token}"})
+                                      headers=headers)
         else:
             self._http = httpx.Client(base_url=self.api_url, transport=transport,
-                                      timeout=timeout,
-                                      headers={"Authorization": f"Bearer {token}"})
+                                      timeout=timeout, headers=headers)
         self._resources: list[ApiResource] | None = None
 
     def close(self) -> None:

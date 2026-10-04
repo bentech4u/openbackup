@@ -36,6 +36,9 @@ RESOURCES = [
     ("route.openshift.io", "v1", "routes", "Route", True),
     ("storage.k8s.io", "v1", "storageclasses", "StorageClass", False),
     ("image.openshift.io", "v1", "imagestreams", "ImageStream", True),
+    ("rbac.authorization.k8s.io", "v1", "clusterroles", "ClusterRole", False),
+    ("rbac.authorization.k8s.io", "v1", "clusterrolebindings", "ClusterRoleBinding", False),
+    ("oauth.openshift.io", "v1", "oauthaccesstokens", "OAuthAccessToken", False),
     ("kubevirt.io", "v1", "virtualmachines", "VirtualMachine", True),
     ("kubevirt.io", "v1", "virtualmachineinstances", "VirtualMachineInstance", True),
 ]
@@ -52,6 +55,23 @@ class FakeKube:
         self.username = "system:serviceaccount:openbackup:backup"
         self.on_create = []  # callbacks(obj) after a create/apply
         self._rv = itertools.count(1)
+        # When set, only these bearer tokens are accepted; each maps to a user
+        # and that user's denied (verb, resource) pairs.
+        self.tokens: dict[str, tuple[str, set]] | None = None
+        self.oauth_url = "https://oauth-openshift.apps.test/oauth/authorize"
+        self.on_create.append(self._fill_sa_token)
+
+    def _fill_sa_token(self, obj: dict) -> None:
+        if obj["kind"] == "Secret" and obj.get("type") == "kubernetes.io/service-account-token":
+            import base64
+
+            sa = obj["metadata"]["annotations"]["kubernetes.io/service-account.name"]
+            token = f"sa-{sa}"
+            obj["data"] = {"token": base64.b64encode(token.encode()).decode()}
+            if self.tokens is not None:
+                denied = {("create", "clusterrolebindings"), ("list", "secrets")} \
+                    if sa.endswith("backup") else set()
+                self.tokens[token] = (f"system:serviceaccount:openbackup:{sa}", denied)
 
     # --------------------------------------------------------------- seeding
 
@@ -87,6 +107,15 @@ class FakeKube:
         path = unquote(u.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         self.calls.append((req.method, path))
+        if path == "/.well-known/oauth-authorization-server":
+            return self._json(200, {"authorization_endpoint": self.oauth_url})
+        auth = req.headers.get("authorization", "")
+        denied = self.denied
+        if self.tokens is not None:
+            entry = self.tokens.get(auth.removeprefix("Bearer "))
+            if entry is None:
+                return self._status(401, "Unauthorized", "Unauthorized")
+            self.username, denied = entry[0], entry[1] | self.denied
         if path == "/version":
             return self._json(200, {"major": "1", "minor": "31", "gitVersion": "v1.31.0"})
         if path == "/api/v1" and req.method == "GET":
@@ -100,7 +129,7 @@ class FakeKube:
             return self._json(201, {"status": {"userInfo": {"username": self.username}}})
         if path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews":
             a = json.loads(req.content)["spec"]["resourceAttributes"]
-            allowed = (a["verb"], a["resource"]) not in self.denied
+            allowed = (a["verb"], a["resource"]) not in denied
             return self._json(201, {"status": {"allowed": allowed}})
 
         parts = path.strip("/").split("/")
@@ -120,8 +149,8 @@ class FakeKube:
         t = self.types.get((group, plural))
         if t is None:
             return self._status(404, "NotFound", f"no resource {group}/{plural}")
-        if (req.method.lower(), plural) in self.denied or (
-                {"GET": "list" if name is None else "get"}.get(req.method), plural) in self.denied:
+        if (req.method.lower(), plural) in denied or (
+                {"GET": "list" if name is None else "get"}.get(req.method), plural) in denied:
             return self._status(403, "Forbidden", f"cannot {req.method} {plural}")
         namespaced = t[4]
         if sub:

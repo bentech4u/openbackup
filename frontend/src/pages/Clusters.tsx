@@ -246,7 +246,21 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
   const [backupToken, setBackupToken] = useState("");
   const [restoreToken, setRestoreToken] = useState("");
   const [vcenterId, setVcenterId] = useState<number | "">("");
-  const [result, setResult] = useState<{ backup: Probe; restore: Probe | null } | null>(null);
+  const [mode, setMode] = useState<"setup" | "tokens">("setup");
+  const [adminKind, setAdminKind] = useState<"password" | "token">("password");
+  const [username, setUsername] = useState("kubeadmin");
+  const [password, setPassword] = useState("");
+  const [adminToken, setAdminToken] = useState("");
+  const [oauthChain, setOauthChain] = useState<ChainCert[] | null>(null);
+  const [oauthCa, setOauthCa] = useState("");
+  const [restoreAccount, setRestoreAccount] = useState(true);
+  const [result, setResult] = useState<{
+    backup: Probe;
+    restore: Probe | null;
+    admin_user?: string;
+    created?: string[];
+    skipped?: string[];
+  } | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -266,7 +280,23 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
     }
   }
 
+  async function fetchOauth() {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await post<{ authorize_url: string; chain: ChainCert[] }>("/api/clusters/oauth-info", { api_url: url.trim(), ca_pem: caPem });
+      setOauthChain(r.chain);
+      const ca = [...r.chain].reverse().find((x) => x.is_ca) ?? r.chain[r.chain.length - 1];
+      setOauthCa(ca?.pem ?? "");
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function save() {
+    if (mode === "setup") return runSetup();
     setBusy(true);
     setError("");
     try {
@@ -287,10 +317,55 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
     }
   }
 
+  async function runSetup() {
+    setBusy(true);
+    setError("");
+    try {
+      const r = await post<{ backup: Probe; restore: Probe | null; admin_user: string; created: string[]; skipped: string[] }>("/api/clusters/setup", {
+        name: name.trim(),
+        api_url: url.trim(),
+        ca_pem: caPem,
+        vcenter_id: vcenterId === "" ? null : vcenterId,
+        restore_account: restoreAccount,
+        admin:
+          adminKind === "password"
+            ? { kind: "password", username: username.trim(), password, oauth_ca_pem: oauthCa }
+            : { kind: "token", token: adminToken.trim() },
+      });
+      setPassword("");
+      setAdminToken("");
+      setResult(r);
+      onDone();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const canSave =
+    !!caPem &&
+    !!name &&
+    (mode === "tokens"
+      ? !!backupToken
+      : adminKind === "token"
+        ? !!adminToken
+        : !!username && !!password && !!oauthCa);
+
   if (result) {
     return (
       <Modal title="Cluster added" onClose={onClose} footer={<Button variant="primary" onClick={onClose}>Done</Button>}>
         <div className="stack">
+          {result.admin_user && (
+            <Alert tone="good">
+              Set up as {result.admin_user}. OpenBackup now uses its own service accounts; the admin credentials were not stored
+              {adminKind === "password" ? " and the login session was revoked" : ""}.
+            </Alert>
+          )}
+          {result.created && result.created.length > 0 && (
+            <div className="muted small">Created or updated: {result.created.join(", ")}</div>
+          )}
+          {result.skipped && result.skipped.length > 0 && <div className="muted small">Skipped: {result.skipped.join("; ")}</div>}
           <Perms p={result.backup} title="Backup token" />
           {result.restore && <Perms p={result.restore} title="Restore token" />}
           {result.backup.permissions.read_secrets && (
@@ -309,8 +384,8 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
       footer={
         <>
           <Button onClick={onClose}>Cancel</Button>
-          <Button variant="primary" onClick={save} busy={busy} disabled={!caPem || !backupToken || !name}>
-            Test and save
+          <Button variant="primary" onClick={save} busy={busy} disabled={!canSave}>
+            {mode === "setup" ? "Set up cluster" : "Test and save"}
           </Button>
         </>
       }
@@ -360,12 +435,86 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
             )}
           </div>
         </Card>
-        <Field label="Backup token" hint="From deploy/openshift/backup-serviceaccount.yaml (read-only, cluster-reader)">
+        <div className="segmented">
+          <button type="button" className={mode === "setup" ? "on" : ""} onClick={() => setMode("setup")}>
+            Set up with admin credentials
+          </button>
+          <button type="button" className={mode === "tokens" ? "on" : ""} onClick={() => setMode("tokens")}>
+            Use existing tokens
+          </button>
+        </div>
+        {mode === "setup" ? (
+          <Card title="Cluster administrator (used once, not stored)">
+            <div className="stack">
+              <div className="muted small">
+                OpenBackup creates its own <code>openbackup</code> namespace with a read-only backup service account (and a restore
+                account if you want one), then uses only those. The credentials below are not saved; a password login's session is
+                revoked right after setup.
+              </div>
+              <div className="segmented">
+                <button type="button" className={adminKind === "password" ? "on" : ""} onClick={() => setAdminKind("password")}>
+                  Username and password
+                </button>
+                <button type="button" className={adminKind === "token" ? "on" : ""} onClick={() => setAdminKind("token")}>
+                  Admin token
+                </button>
+              </div>
+              {adminKind === "password" ? (
+                <>
+                  <div className="form-grid">
+                    <Field label="Username" hint="kubeadmin, or any cluster-admin user">
+                      <input value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="off" />
+                    </Field>
+                    <Field label="Password">
+                      <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" />
+                    </Field>
+                  </div>
+                  <div className="stack" style={{ gap: 8 }}>
+                    <div className="muted small">
+                      Password login goes through the cluster's OAuth server on the ingress, which usually has its own certificate.
+                    </div>
+                    <div>
+                      <Button onClick={fetchOauth} busy={busy && !oauthChain} disabled={!caPem}>
+                        Fetch OAuth server certificate
+                      </Button>
+                    </div>
+                    {oauthChain?.map((c) => (
+                      <label key={c.sha256} className="check">
+                        <input type="radio" checked={oauthCa === c.pem} onChange={() => setOauthCa(c.pem)} />
+                        <span>
+                          <div>
+                            {c.subject} {c.is_ca && <Badge tone="info">CA</Badge>}
+                          </div>
+                          <div className="mono small">SHA-256 {c.sha256}</div>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <Field label="Admin token" hint="From `oc whoami -t` while logged in as a cluster admin">
+                  <textarea className="mono small" rows={2} value={adminToken} onChange={(e) => setAdminToken(e.target.value)} />
+                </Field>
+              )}
+              <label className="check">
+                <input type="checkbox" checked={restoreAccount} onChange={(e) => setRestoreAccount(e.target.checked)} />
+                <span>
+                  Also create the restore account and keep its token
+                  <div className="muted small">Needed to restore into this cluster without pasting a token each time.</div>
+                </span>
+              </label>
+            </div>
+          </Card>
+        ) : (
+          <>
+        <Field label="Backup token" hint="From backup-serviceaccount.yaml (read-only, cluster-reader)">
           <textarea className="mono small" rows={3} value={backupToken} onChange={(e) => setBackupToken(e.target.value)} />
         </Field>
         <Field label="Restore token (optional)" hint="From restore-serviceaccount.yaml. Leave empty to paste it for each restore instead of storing it.">
           <textarea className="mono small" rows={2} value={restoreToken} onChange={(e) => setRestoreToken(e.target.value)} />
         </Field>
+          </>
+        )}
         <Field label="vCenter for persistent volume data" hint="The vCenter whose vSphere CSI volumes this cluster uses">
           <select value={vcenterId} onChange={(e) => setVcenterId(e.target.value ? Number(e.target.value) : "")}>
             <option value="">None (resources only)</option>
