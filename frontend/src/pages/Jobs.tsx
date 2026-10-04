@@ -90,7 +90,11 @@ export default function Jobs() {
                       {j.description && <div className="muted small">{j.description}</div>}
                     </td>
                     <td title={(j.kind === "openshift" ? (j.selection.namespaces as string[]) ?? [] : j.vms.map((v) => v.name)).join(", ")}>
-                      {j.kind === "openshift" ? `${((j.selection.namespaces as string[]) ?? []).length} namespace(s)` : `${j.vms.length} VM(s)`}
+                      {j.kind === "openshift"
+                        ? `${((j.selection.namespaces as string[]) ?? []).length} namespace(s)`
+                        : j.kind === "etcd"
+                          ? "etcd backups"
+                          : `${j.vms.length} VM(s)`}
                     </td>
                     <td>{repoName(j.repository_id)}</td>
                     <td>
@@ -216,10 +220,18 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [kind, setKind] = useState<"vsphere" | "openshift">(
-    (job?.kind as "vsphere" | "openshift") ?? (vcenters.length || !clusters.length ? "vsphere" : "openshift"),
+  const [kind, setKind] = useState<"vsphere" | "openshift" | "etcd">(
+    job?.kind ?? (vcenters.length || !clusters.length ? "vsphere" : "openshift"),
   );
-  const steps = ["General", kind === "openshift" ? "Namespaces" : "Virtual machines", "Storage", "Schedule", "Summary"];
+  const steps = ["General", kind === "openshift" ? "Namespaces" : kind === "etcd" ? "Source" : "Virtual machines", "Storage", "Schedule", "Summary"];
+  const src0 = (job?.selection?.source as Record<string, string>) ?? {};
+  const [etcdSrc, setEtcdSrc] = useState({
+    server: src0.server ?? "",
+    export: src0.export ?? "",
+    path: src0.path ?? "etcd-backup",
+    label: src0.label ?? "",
+    options: src0.options ?? "nfsvers=4,hard",
+  });
   const [clusterId, setClusterId] = useState(job?.cluster_id ?? clusters[0]?.id ?? 0);
   const [namespaces, setNamespaces] = useState<Set<string>>(new Set((job?.selection?.namespaces as string[]) ?? []));
   const [freezeVms, setFreezeVms] = useState<boolean>((job?.selection?.freeze_vms as boolean) ?? true);
@@ -264,6 +276,7 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
     if (s === 0 && kind === "openshift" && !clusterId) return "Choose a cluster";
     if (s === 1 && kind === "vsphere" && selected.size === 0) return "Select at least one VM";
     if (s === 1 && kind === "openshift" && namespaces.size === 0) return "Select at least one namespace";
+    if (s === 1 && kind === "etcd" && (!etcdSrc.server.trim() || !etcdSrc.export.trim())) return "Enter the NFS server and export";
     if (s === 2 && !repoId) return "Choose a repository";
     if (s === 2 && !points && !days) return "Keep restore points by count, by days, or both";
     if (s === 3 && schedKind === "weekly" && weekDays.length === 0) return "Pick at least one day";
@@ -284,10 +297,15 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
       description,
       kind,
       vcenter_id: kind === "vsphere" ? vcenterId : null,
-      cluster_id: kind === "openshift" ? clusterId : null,
+      cluster_id: kind === "openshift" ? clusterId : kind === "etcd" && clusterId ? clusterId : null,
       repository_id: repoId,
       vms: kind === "vsphere" ? [...selected].map(([moref, n]) => ({ moref, name: n })) : [],
-      selection: kind === "openshift" ? { namespaces: [...namespaces], freeze_vms: freezeVms } : {},
+      selection:
+        kind === "openshift"
+          ? { namespaces: [...namespaces], freeze_vms: freezeVms }
+          : kind === "etcd"
+            ? { source: { ...etcdSrc, server: etcdSrc.server.trim(), export: etcdSrc.export.trim(), path: etcdSrc.path.trim() } }
+            : {},
       schedule_cron: cron,
       enabled,
       retention_points: points,
@@ -361,9 +379,17 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
                 <button type="button" disabled={!!job} className={kind === "openshift" ? "on" : ""} onClick={() => setKind("openshift")}>
                   OpenShift namespaces
                 </button>
+                <button type="button" disabled={!!job} className={kind === "etcd" ? "on" : ""} onClick={() => setKind("etcd")}>
+                  OpenShift etcd backups
+                </button>
               </div>
             </Field>
-            {kind === "openshift" ? (
+            {kind === "etcd" ? (
+              <Alert tone="info">
+                Collects the etcd backup sets your cluster already writes (with <code>cluster-backup.sh</code>) to an NFS share, and keeps
+                them in a repository with retention and encryption. OpenBackup needs no access to the cluster for this.
+              </Alert>
+            ) : kind === "openshift" ? (
               <Field label="Cluster">
                 <select value={clusterId} onChange={(e) => { setClusterId(Number(e.target.value)); setNamespaces(new Set()); }}>
                   {clusters.map((c) => (
@@ -443,6 +469,25 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
             <div className="muted small">Secrets are never backed up. Restored applications need their Secrets recreated.</div>
           </>
         )}
+        {step === 1 && kind === "etcd" && (
+          <>
+            <div className="form-grid">
+              <Field label="NFS server" hint="An address this server can reach">
+                <input value={etcdSrc.server} onChange={(e) => setEtcdSrc({ ...etcdSrc, server: e.target.value })} placeholder="192.168.68.126" />
+              </Field>
+              <Field label="Export">
+                <input value={etcdSrc.export} onChange={(e) => setEtcdSrc({ ...etcdSrc, export: e.target.value })} placeholder="/volume1/homelab" />
+              </Field>
+              <Field label="Folder with the backup sets" hint="Holds YYYYMMDD-HHMM folders">
+                <input value={etcdSrc.path} onChange={(e) => setEtcdSrc({ ...etcdSrc, path: e.target.value })} />
+              </Field>
+              <Field label="Name for these backups" hint="e.g. the cluster name">
+                <input value={etcdSrc.label} onChange={(e) => setEtcdSrc({ ...etcdSrc, label: e.target.value })} placeholder="homelab" />
+              </Field>
+            </div>
+            <div className="muted small">The share is mounted read-only. Only sets not collected yet are read on each run.</div>
+          </>
+        )}
         {step === 1 && kind === "vsphere" && (
           <>
             <div className="row gap-s">
@@ -517,7 +562,7 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
                 <input type="number" min={0} value={fullDays} onChange={(e) => setFullDays(Number(e.target.value))} />
               </Field>
             </div>
-            {kind === "vsphere" ? (
+            {kind === "etcd" ? null : kind === "vsphere" ? (
             <label className="check">
               <input type="checkbox" checked={quiesce} onChange={(e) => setQuiesce(e.target.checked)} />
               <span>
@@ -580,7 +625,14 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
           <dl className="kv">
             <dt>Name</dt>
             <dd>{name}</dd>
-            {kind === "openshift" ? (
+            {kind === "etcd" ? (
+              <>
+                <dt>Source</dt>
+                <dd className="mono small">
+                  {etcdSrc.server}:{etcdSrc.export}/{etcdSrc.path}
+                </dd>
+              </>
+            ) : kind === "openshift" ? (
               <>
                 <dt>Cluster</dt>
                 <dd>{clusters.find((c) => c.id === clusterId)?.name}</dd>

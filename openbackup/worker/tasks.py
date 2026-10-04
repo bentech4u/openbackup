@@ -115,6 +115,8 @@ def run_backup(task_id: int, ctx: DbTaskContext) -> tuple[TaskState, str]:
     task, job, repo_row, vc = _load(task_id)
     if job is not None and job.kind == JobKind.openshift:
         return _run_openshift_backup(task_id, task, job, repo_row, vc, ctx)
+    if job is not None and job.kind == JobKind.etcd:
+        return _run_etcd_collection(job, repo_row, ctx)
     if job is None or repo_row is None or vc is None:
         return TaskState.failed, "Job, repository or vCenter no longer exists"
     wanted = task.params.get("vms") or [v["moref"] for v in job.vms]
@@ -277,6 +279,58 @@ def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskSt
     if failed and not (ok or warned):
         return TaskState.failed, summary
     if failed or warned:
+        return TaskState.warning, summary
+    return TaskState.success, summary
+
+
+def _run_etcd_collection(job, repo_row, ctx) -> tuple[TaskState, str]:
+    from ..config import get_settings
+    from ..kube import etcd
+    from ..repo import nfs
+
+    if repo_row is None:
+        return TaskState.failed, "Repository no longer exists"
+    src = job.selection["source"]
+    label = src.get("label") or ""
+    if not label and job.cluster_id:
+        with session_scope() as db:
+            c = db.get(KubeCluster, job.cluster_id)
+            label = c.name if c else ""
+    label = label or job.name
+    mp = get_settings().mount_root / f"etcd-job-{job.id}"
+    nfs.ensure_mounted(src["server"], src["export"], mp, src.get("options") or "nfsvers=4,hard",
+                       read_only=True)
+    root = mp / src["path"].strip("/") if src.get("path", "").strip("/") else mp
+    sets = etcd.find_sets(root)
+    if not sets:
+        return TaskState.failed, f"No complete etcd backup sets in {src['server']}:" \
+                                 f"{src['export']}/{src.get('path', '')}"
+    with services.open_repository(repo_row) as repo:
+        have = etcd.collected_sets(repo, label)
+        new = [s for s in sets if s.name not in have]
+        ctx.log(f"{len(sets)} etcd backup set(s) on the share, {len(new)} not yet collected")
+        ctx.progress(0.0, total=sum(f.stat().st_size for s in new for f in s.files) or 1)
+        for s in new:
+            if ctx.cancelled():
+                raise Cancelled()
+            ctx.item(s.name, kind="etcd", state="running")
+            manifest = etcd.ingest(repo, s, label, job.id, job.name, ctx)
+            record_point(repo_row.id, manifest)
+            ctx.item(s.name, state="success", point_id=manifest["id"],
+                     new=manifest["new_bytes"])
+            ctx.log(f"Collected {s.name} ({len(s.files)} files)")
+        _apply_retention(ctx, repo, repo_row.id, job, etcd.subject_id(label))
+        _gc_if_needed(ctx, repo)
+    with session_scope() as db:
+        j = db.get(Job, job.id)
+        if j:
+            j.last_run_at = datetime.now(UTC)
+    newest = max(s.taken_at for s in sets)
+    age_h = (datetime.now(UTC) - newest).total_seconds() / 3600
+    summary = f"{len(new)} new etcd backup set(s) collected; newest is {sets[-1].name}"
+    if age_h > 26:
+        ctx.log(f"The newest etcd backup on the share is {age_h:.0f} hours old: is the "
+                "cluster's backup schedule still running?", "warning")
         return TaskState.warning, summary
     return TaskState.success, summary
 

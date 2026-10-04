@@ -4,6 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -83,11 +84,47 @@ async def get_point(point_id: str, db: Session = Depends(get_db),
     out.update(config=m.get("config", {}), vcenter=m.get("vcenter", ""),
                warnings=m.get("warnings", []), duration_s=m.get("duration_s"),
                disk_details=m.get("disks", []))
+    if p.subject_kind == "etcd":
+        out.update(files=m.get("files", []), source_set=m.get("source_set", ""),
+                   collected_at=m.get("collected_at"))
     if p.subject_kind == "namespace":
         out.update(cluster=m.get("cluster", {}), namespace=m.get("namespace", ""),
                    resources=m.get("resources", {}), pvcs=m.get("pvcs", []),
                    skipped_types=m.get("skipped_types", []))
     return out
+
+
+@router.get("/{point_id}/files/{key}")
+async def download_file(point_id: str, key: str, request: Request, db: Session = Depends(get_db),
+                        pr: Principal = Depends(operator)):
+    """A file stored in a point (etcd snapshots and the like), streamed from
+    the repository and verified block by block."""
+    p = _point(db, point_id)
+    if p.subject_kind != "etcd":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "This point holds disks, not files")
+    row = db.get(RepoRow, p.repository_id)
+    db.expunge(row)
+    try:
+        manifest = await run_in_threadpool(_manifest, row, point_id)
+    except (services.ServiceError, RepositoryError, OSError) as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Repository unavailable: {e}") \
+            from None
+    rec = next((f for f in manifest.get("files", []) if f["key"] == key), None)
+    if rec is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No such file in this point")
+    audit(db, request, "point.download", principal=pr, target=f"{point_id}:{rec['name']}",
+          detail={"bytes": rec["capacity"]})
+    db.commit()
+
+    def chunks():
+        with services.open_repository(row) as repo:
+            m = repo.load_map(point_id, key)
+            for i, cid in enumerate(m.ids):
+                yield repo.read_chunk(cid, m.block_length(i))
+
+    return StreamingResponse(chunks(), media_type="application/octet-stream", headers={
+        "Content-Disposition": f'attachment; filename="{rec["name"]}"',
+        "Content-Length": str(rec["capacity"])})
 
 
 @router.post("/{point_id}/verify", response_model=TaskOut, status_code=202)

@@ -124,6 +124,7 @@ export function PointPage() {
   if (point.error) return <Alert>{errorText(point.error)}</Alert>;
   const p = point.data!;
   if (p.subject_kind === "namespace") return <NamespacePoint point={p as NamespacePointDetail} />;
+  if (p.subject_kind === "etcd") return <EtcdPoint point={p as EtcdPointDetail} />;
 
   async function startTask(fn: () => Promise<Task>) {
     setBusy(true);
@@ -695,5 +696,84 @@ function NamespaceRestore({ point, onClose }: { point: NamespacePointDetail; onC
         </label>
       </div>
     </Modal>
+  );
+}
+
+interface EtcdPointDetail extends PointDetail {
+  files: { key: string; name: string; capacity: number; sha256: string }[];
+  source_set: string;
+  collected_at: string;
+}
+
+function EtcdPoint({ point: p }: { point: EtcdPointDetail }) {
+  const nav = useNavigate();
+  const { can } = useAuth();
+  return (
+    <>
+      <PageHeader
+        title={`${p.vm_name} — ${dateTime(p.created_at)}`}
+        subtitle={
+          <span className="row gap-s">
+            <Button variant="ghost" onClick={() => nav("/restore")}>
+              <ArrowLeft size={14} /> All backups
+            </Button>
+            <Badge tone="info">etcd backup set {p.source_set}</Badge>
+          </span>
+        }
+      />
+      <Card title="Files" pad={false}>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Size</th>
+                <th>SHA-256</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {p.files.map((f) => (
+                <tr key={f.key}>
+                  <td className="mono small">{f.name}</td>
+                  <td className="nowrap">{bytes(f.capacity)}</td>
+                  <td className="mono small muted" title={f.sha256}>
+                    {f.sha256.slice(0, 16)}…
+                  </td>
+                  <td className="right">
+                    {can("operator") && (
+                      <a className="btn btn-secondary" href={`/api/points/${p.id}/files/${f.key}`}>
+                        Download
+                      </a>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+      <Card title="Restoring etcd (runbook)">
+        <div className="stack small">
+          <Alert tone="warn">
+            Restoring etcd rolls the whole cluster back to this moment. It is the last resort for a cluster that cannot be repaired; for
+            applications, restore their namespaces instead.
+          </Alert>
+          <ol style={{ margin: 0, paddingLeft: 18, lineHeight: 1.7 }}>
+            <li>Download both files above and check their SHA-256 sums.</li>
+            <li>
+              Copy them to one healthy control-plane node, into <code>/home/core/assets/backup/</code>.
+            </li>
+            <li>
+              Follow Red Hat's &quot;Restoring to a previous cluster state&quot; procedure for your OpenShift version: stop the static pods on
+              the other control-plane nodes, then run <code>sudo -E /usr/local/bin/cluster-restore.sh /home/core/assets/backup</code> on the
+              recovery node.
+            </li>
+            <li>Restart the kubelet on all control-plane nodes, approve pending CSRs, and wait for the etcd and API operators to settle.</li>
+            <li>Then restore application namespaces from their own backups if they are newer than this snapshot.</li>
+          </ol>
+        </div>
+      </Card>
+    </>
   );
 }

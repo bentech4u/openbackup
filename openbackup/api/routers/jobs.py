@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ...db.models import Job, JobKind, KubeCluster, Repository, Task, TaskState, VCenter
+from ...repo import nfs
 from ...services import next_run, valid_cron
 from ...worker.main import enqueue_backup
 from ..deps import Principal, admin, audit, get_db, operator, viewer
@@ -36,6 +37,31 @@ class OpenShiftSelection(BaseModel):
             if not re.fullmatch(NAMESPACE_RE, n) or len(n) > 63:
                 raise ValueError(f"Invalid namespace name {n!r}")
         return sorted(set(v))
+
+
+class EtcdSource(BaseModel):
+    """An NFS location holding etcd backup sets; always mounted read-only."""
+
+    server: str = Field(min_length=1, max_length=255)
+    export: str = Field(min_length=1, max_length=1024)
+    path: str = Field("", max_length=1024)
+    options: str = Field("nfsvers=4,hard", max_length=255)
+    # Names the backups ("homelab etcd"); defaults to the job's cluster or name.
+    label: str = Field("", max_length=128)
+
+    @model_validator(mode="after")
+    def _safe(self) -> EtcdSource:
+        try:
+            nfs.validate(self.server, self.export, self.options)
+        except nfs.NfsError as e:
+            raise ValueError(str(e)) from None
+        if ".." in self.path.split("/"):
+            raise ValueError("Invalid folder")
+        return self
+
+
+# OpenShift node VMs are named <infra-id>-master-N / -control-plane-N.
+CONTROL_PLANE_RE = re.compile(r"-(master|control-plane)-\d+$")
 
 
 class JobIn(BaseModel):
@@ -68,17 +94,31 @@ class JobIn(BaseModel):
             if self.vcenter_id is None or not self.vms:
                 raise ValueError("A vSphere job needs a vCenter and at least one VM")
             self.cluster_id, self.selection = None, {}
+            nodes = [v.name for v in self.vms if CONTROL_PLANE_RE.search(v.name)]
+            if nodes:
+                raise ValueError(
+                    f"{', '.join(nodes)} look like OpenShift control-plane nodes. Restoring "
+                    "them from VM snapshots is not supported by Red Hat and can corrupt etcd; "
+                    "protect the cluster with an etcd collection job and OpenShift namespace "
+                    "jobs instead")
         elif self.kind == JobKind.openshift:
             if self.cluster_id is None:
                 raise ValueError("An OpenShift job needs a cluster")
             self.selection = OpenShiftSelection(**self.selection).model_dump()
             self.vms = []
+        elif self.kind == JobKind.etcd:
+            source = EtcdSource(**(self.selection.get("source") or {}))
+            self.selection = {"source": source.model_dump()}
+            self.vms, self.vcenter_id = [], None
         return self
 
 
 def _check_refs(db: Session, body: JobIn) -> None:
     if body.kind == JobKind.vsphere and db.get(VCenter, body.vcenter_id) is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown vCenter")
+    if body.kind == JobKind.etcd and body.cluster_id is not None \
+            and db.get(KubeCluster, body.cluster_id) is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown cluster")
     if body.kind == JobKind.openshift:
         cluster = db.get(KubeCluster, body.cluster_id)
         if cluster is None:

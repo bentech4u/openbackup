@@ -4,68 +4,14 @@ from __future__ import annotations
 
 import os
 import shutil
-import time
 
 import pytest
-from fake_vsphere import FakeVSphere
+from conftest import run_worker_until_idle
 
 pytestmark = pytest.mark.skipif(shutil.which("nbdkit") is None, reason="nbdkit not installed")
 
 MiB = 1 << 20
 THUMB = ":".join(["AB"] * 20)
-
-
-@pytest.fixture
-def fake(tmp_path, monkeypatch):
-    from openbackup.api.routers import vcenters
-    from openbackup.worker import tasks
-
-    vs = FakeVSphere(tmp_path / "vsphere")
-    monkeypatch.setattr(vcenters, "connector", lambda *a: vs)
-    monkeypatch.setattr(tasks, "source_factory", lambda vc: vs)
-    return vs
-
-
-def run_worker_until_idle(timeout: float = 60) -> None:
-    from openbackup.db import session_scope
-    from openbackup.db.models import Task, TaskState
-    from openbackup.worker.main import Worker
-
-    w = Worker()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        w.run_once()
-        with session_scope() as db:
-            busy = db.query(Task).filter(Task.state.in_([TaskState.queued,
-                                                         TaskState.running])).count()
-        if not busy and not w.threads:
-            return
-        time.sleep(0.1)
-    raise AssertionError("worker did not finish")
-
-
-@pytest.fixture
-def setup(admin_api, fake, tmp_path):
-    vm = fake.add_vm("web01", [8 * MiB, 2 * MiB])
-    fake.write(vm, 2000, 0, os.urandom(3 * MiB))
-    fake.write(vm, 2001, MiB, os.urandom(1000))
-    r = admin_api.post("/api/vcenters", json={"name": "vc1", "host": "vc.example",
-                                              "username": "backup@vsphere.local",
-                                              "password": "vc-pass", "thumbprint": THUMB})
-    assert r.status_code == 201, r.text
-    vc_id = r.json()["id"]
-    assert "vc-pass" not in r.text
-    r = admin_api.post("/api/repositories", json={
-        "name": "local", "kind": "local", "path": str(tmp_path / "backups"),
-        "passphrase": "repository passphrase"})
-    assert r.status_code == 201, r.text
-    repo_id = r.json()["id"]
-    r = admin_api.post("/api/jobs", json={
-        "name": "Daily", "vcenter_id": vc_id, "repository_id": repo_id,
-        "vms": [{"moref": vm.moref, "name": vm.name}], "schedule_cron": "0 22 * * *",
-        "retention_points": 2})
-    assert r.status_code == 201, r.text
-    return {"vm": vm, "vc_id": vc_id, "repo_id": repo_id, "job_id": r.json()["id"]}
 
 
 def test_backup_restore_cycle(admin_api, fake, setup):
