@@ -150,7 +150,7 @@ class DatastoreAccess(Base):
     datastore: Mapped[str] = mapped_column(String(255))
     nfs_server: Mapped[str] = mapped_column(String(255))
     nfs_export: Mapped[str] = mapped_column(String(1024))
-    nfs_options: Mapped[str] = mapped_column(String(255), default="nfsvers=4,hard")
+    nfs_options: Mapped[str] = mapped_column(String(255), default="nfsvers=3,hard")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 

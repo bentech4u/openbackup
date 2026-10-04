@@ -379,6 +379,16 @@ class VSphere:
         self.wait(snap.RemoveSnapshot_Task(removeChildren=False, consolidate=True),
                   timeout=6 * 3600)
 
+    def consolidation_needed(self, vm: Any) -> bool:
+        self.ensure_session()
+        return bool(self.rebind(vm).runtime.consolidationNeeded)
+
+    def consolidate(self, vm: Any) -> None:
+        """Merge leftover delta disks back into their base disks (what the
+        vSphere client's Snapshots > Consolidate does)."""
+        self.ensure_session()
+        self.wait(self.rebind(vm).ConsolidateVMDisks_Task(), timeout=6 * 3600)
+
     def snapshot_by_moref(self, moref: str) -> Any:
         return vim.vm.Snapshot(moref, self.si._stub)
 

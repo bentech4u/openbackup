@@ -230,7 +230,7 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
     export: src0.export ?? "",
     path: src0.path ?? "etcd-backup",
     label: src0.label ?? "",
-    options: src0.options ?? "nfsvers=4,hard",
+    options: src0.options ?? "nfsvers=3,hard",
   });
   const [clusterId, setClusterId] = useState(job?.cluster_id ?? clusters[0]?.id ?? 0);
   const [namespaces, setNamespaces] = useState<Set<string>>(new Set((job?.selection?.namespaces as string[]) ?? []));

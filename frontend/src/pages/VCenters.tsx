@@ -435,7 +435,7 @@ function DirectNfsEditor({ vcId, ds, onClose, onDone }: { vcId: number; ds: Data
   const cur = ds.direct_nfs;
   const [server, setServer] = useState(cur?.nfs_server ?? ds.remote_host);
   const [exp, setExp] = useState(cur?.nfs_export ?? ds.remote_path);
-  const [options, setOptions] = useState(cur?.nfs_options ?? "nfsvers=4,hard");
+  const [options, setOptions] = useState(cur?.nfs_options ?? "nfsvers=3,hard");
   const [test, setTest] = useState<DsTest | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -494,7 +494,7 @@ function DirectNfsEditor({ vcId, ds, onClose, onDone }: { vcId: number; ds: Data
           <Field label="Export path">
             <input value={exp} onChange={(e) => { setExp(e.target.value); setTest(null); }} />
           </Field>
-          <Field label="Mount options" hint='"ro" is always added; "rw" is refused'>
+          <Field label="Mount options" hint='"ro" is always added. Keep nfsvers=3, as ESXi uses: NFS v4 file leases on disks this server just read can make vSphere disk consolidation fail.'>
             <input className="mono" value={options} onChange={(e) => { setOptions(e.target.value); setTest(null); }} />
           </Field>
         </div>

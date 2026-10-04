@@ -20,13 +20,17 @@ from ..vsphere.types import DiskInfo
 
 @dataclass
 class DirectNfsAccess:
-    """Where this server can read an NFS datastore, always read-only."""
+    """Where this server can read an NFS datastore, always read-only.
+
+    NFS v3 by default, as ESXi itself uses: with v4 the NAS may grant this
+    server a lease (delegation) on a disk it has read, and ESXi's writes to
+    that disk during snapshot consolidation then fail."""
 
     id: int
     datastore: str
     server: str
     export: str
-    options: str = "nfsvers=4,hard"
+    options: str = "nfsvers=3,hard"
 
     def mountpoint(self, root: Path) -> Path:
         return root / f"ds-{self.id}"

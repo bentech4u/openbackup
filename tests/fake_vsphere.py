@@ -51,6 +51,9 @@ class FakeVSphere:
         self.fail_remove_snapshot = False
         self.cbt_broken = False
         self.calls: list[str] = []
+        # VM moref -> number of consolidations that will fail before one works.
+        self.consolidation_failures: dict[str, int] = {}
+        self.needs_consolidation: set[str] = set()
         # Serve snapshot disks as flat VMDKs read through FlatDisk, the way
         # direct NFS reads a datastore.
         self.direct = False
@@ -138,6 +141,17 @@ class FakeVSphere:
             d.file = str(files[d.key])
             disks.append(d)
         return snap, SnapshotRef(snap.moref, disks)
+
+    def consolidation_needed(self, vm: FakeVm) -> bool:
+        return vm.moref in self.needs_consolidation
+
+    def consolidate(self, vm: FakeVm) -> None:
+        self.calls.append(f"consolidate:{vm.moref}")
+        left = self.consolidation_failures.get(vm.moref, 0)
+        if left:
+            self.consolidation_failures[vm.moref] = left - 1
+            raise VSphereError("simulated consolidation failure")
+        self.needs_consolidation.discard(vm.moref)
 
     def remove_snapshot(self, snap: FakeSnapshot) -> None:
         if self.fail_remove_snapshot:

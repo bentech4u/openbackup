@@ -52,6 +52,34 @@ def human(n: float) -> str:
     return f"{n:.1f} TiB"
 
 
+CONSOLIDATE_ATTEMPTS = 3
+CONSOLIDATE_DELAY = 10.0
+
+
+def _ensure_consolidated(source, vm, name: str, ctx: TaskContext,
+                         warn: Callable[[str], None]) -> None:
+    """vSphere sometimes removes a snapshot but fails to merge its delta disk
+    (for instance when the base disk is briefly busy), leaving the VM running
+    on the delta with no snapshot listed. Retry the merge rather than leave
+    the VM like that."""
+    for attempt in range(1, CONSOLIDATE_ATTEMPTS + 1):
+        try:
+            if not source.consolidation_needed(vm):
+                return
+        except Exception as e:
+            warn(f"could not check whether disks need consolidation: {e}")
+            return
+        ctx.log(f"{name}: disk consolidation is needed after removing the snapshot; "
+                f"consolidating (attempt {attempt})", "warning")
+        time.sleep(CONSOLIDATE_DELAY)
+        try:
+            source.consolidate(vm)
+        except Exception as e:
+            ctx.log(f"{name}: consolidation attempt {attempt} failed: {e}", "warning")
+    warn("vSphere still reports that disk consolidation is needed. The VM is running on "
+         "a snapshot delta disk: run Snapshots > Consolidate on it in vSphere.")
+
+
 def blocks_for_extents(extents: list[Extent], block_size: int, capacity: int) -> list[int]:
     """Indices of every block touched by any extent, in order."""
     blocks: set[int] = set()
@@ -102,6 +130,13 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
             source.remove_snapshot(snap)
         except VSphereError as e:
             warn(f"could not remove leftover snapshot: {e}")
+
+    # A VM left running on a delta disk (a consolidation that failed after an
+    # earlier snapshot removal) cannot be backed up correctly: merge it first.
+    if source.consolidation_needed(vm):
+        ctx.log(f"{name}: vSphere reports that disk consolidation is needed; consolidating "
+                "before the backup", "warning")
+        source.consolidate(vm)
 
     if source.ensure_cbt(vm):
         ctx.log(f"{name}: enabled Changed Block Tracking")
@@ -197,6 +232,8 @@ def backup_vm(source: Any, repo: Repository, vm_moref: str, opts: BackupOptions,
         except Exception as e:  # never mask the real error
             warn(f"snapshot {snap_name} could not be removed: {e}. It will be retried on "
                  "the next run; remove it manually if the VM is no longer backed up.")
+        else:
+            _ensure_consolidated(source, vm, name, ctx, warn)
 
     ctx.log(f"{name}: restore point {point_id} created ({manifest['kind']}, read "
             f"{human(totals['read'])}, stored {human(writer.new_bytes)} new)")

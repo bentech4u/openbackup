@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/vcenters/{vc_id}/datastores", tags=["datastores"
 class AccessIn(BaseModel):
     nfs_server: str = Field(min_length=1, max_length=255)
     nfs_export: str = Field(min_length=1, max_length=1024)
-    nfs_options: str = Field("nfsvers=4,hard", max_length=255)
+    nfs_options: str = Field("nfsvers=3,hard", max_length=255)
     enabled: bool = True
 
 

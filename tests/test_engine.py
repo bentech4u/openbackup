@@ -241,3 +241,40 @@ def test_direct_nfs_refuses_vm_with_own_snapshots(env):
     with pytest.raises(DirectNfsError, match="snapshots of its own"):
         backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
     assert vm.snapshots == []  # ours was still removed
+
+
+def test_consolidation_left_over_is_fixed_before_backup(env):
+    vs, repo, _ = env
+    vm = vs.add_vm("cons1", [2 * MiB])
+    vs.needs_consolidation.add(vm.moref)
+    ctx = NullContext()
+    backup_vm(vs, repo, vm.moref, BackupOptions(), ctx)
+    assert vs.calls.index(f"consolidate:{vm.moref}") < next(
+        i for i, c in enumerate(vs.calls) if c.startswith("snapshot:openbackup-manual"))
+    assert vm.moref not in vs.needs_consolidation
+
+
+def test_failed_consolidation_after_snapshot_removal_is_retried(env, monkeypatch):
+    from openbackup.engine import backup as backup_mod
+
+    monkeypatch.setattr(backup_mod, "CONSOLIDATE_DELAY", 0)
+    vs, repo, _ = env
+    vm = vs.add_vm("cons2", [2 * MiB])
+    vm.cbt = True
+    orig = vs.remove_snapshot
+
+    def remove_and_leave_delta(snap):
+        orig(snap)
+        vs.needs_consolidation.add(vm.moref)  # vSphere's merge failed
+
+    vs.remove_snapshot = remove_and_leave_delta
+    vs.consolidation_failures[vm.moref] = 1
+    r = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    assert vm.moref not in vs.needs_consolidation
+    assert vs.calls.count(f"consolidate:{vm.moref}") == 2
+    assert not r.warnings
+
+    # If it never succeeds, the backup still completes but says so clearly.
+    vs.consolidation_failures[vm.moref] = 99
+    r = backup_vm(vs, repo, vm.moref, BackupOptions(), NullContext())
+    assert any("Consolidate" in w for w in r.warnings)

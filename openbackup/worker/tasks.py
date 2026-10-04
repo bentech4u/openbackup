@@ -298,7 +298,7 @@ def _run_etcd_collection(job, repo_row, ctx) -> tuple[TaskState, str]:
             label = c.name if c else ""
     label = label or job.name
     mp = get_settings().mount_root / f"etcd-job-{job.id}"
-    nfs.ensure_mounted(src["server"], src["export"], mp, src.get("options") or "nfsvers=4,hard",
+    nfs.ensure_mounted(src["server"], src["export"], mp, src.get("options") or "nfsvers=3,hard",
                        read_only=True)
     root = mp / src["path"].strip("/") if src.get("path", "").strip("/") else mp
     sets = etcd.find_sets(root)

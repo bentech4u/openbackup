@@ -45,7 +45,7 @@ class EtcdSource(BaseModel):
     server: str = Field(min_length=1, max_length=255)
     export: str = Field(min_length=1, max_length=1024)
     path: str = Field("", max_length=1024)
-    options: str = Field("nfsvers=4,hard", max_length=255)
+    options: str = Field("nfsvers=3,hard", max_length=255)
     # Names the backups ("homelab etcd"); defaults to the job's cluster or name.
     label: str = Field("", max_length=128)
 
