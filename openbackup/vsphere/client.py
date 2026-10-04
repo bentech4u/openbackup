@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import socket
 import ssl
+import threading
 import time
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -89,10 +90,59 @@ class VSphere:
         self.thumbprint = thumbprint
         self.timeout = timeout
         self.si: Any = None
+        self._session_lock = threading.Lock()
+        self._keepalive_stop = threading.Event()
+        self._keepalive: threading.Thread | None = None
 
     # -------------------------------------------------------------- session
+    #
+    # vCenter drops sessions idle for ~30 minutes, and a full read of a large
+    # disk takes far longer than that without any API call. Losing the
+    # session there would strand the backup snapshot on the VM, so the
+    # session is kept alive while connected, and re-established before the
+    # calls that must not fail.
+
+    KEEPALIVE_SECONDS = 300
 
     def connect(self) -> VSphere:
+        self._login()
+        self._keepalive_stop.clear()
+        self._keepalive = threading.Thread(target=self._keepalive_loop, daemon=True,
+                                           name=f"vcenter-keepalive-{self.host}")
+        self._keepalive.start()
+        return self
+
+    def _keepalive_loop(self) -> None:
+        while not self._keepalive_stop.wait(self.KEEPALIVE_SECONDS):
+            try:
+                self.ensure_session()
+            except Exception:
+                pass  # retried next tick; ensure_session runs again before snapshot calls
+
+    def ensure_session(self) -> None:
+        """Make sure the session is still logged in, logging in again if
+        vCenter has expired it."""
+        with self._session_lock:
+            try:
+                if self.si is not None and \
+                        self.si.content.sessionManager.currentSession is not None:
+                    return
+            except Exception:
+                pass
+            old, self.si = self.si, None
+            if old is not None:
+                try:
+                    Disconnect(old)
+                except Exception:
+                    pass
+            self._login()
+
+    def rebind(self, obj: Any) -> Any:
+        """The same managed object on the current session (objects remember the
+        session they were fetched with)."""
+        return type(obj)(obj._moId, self.si._stub)
+
+    def _login(self) -> None:
         try:
             self.si = SmartConnect(
                 host=self.host, port=self.port, user=self.user, pwd=self._password,
@@ -113,9 +163,9 @@ class VSphere:
                     "certificate was replaced, update the thumbprint in the vCenter settings."
                 ) from None
             raise VSphereError(f"Cannot connect to vCenter {self.host}: {e}") from None
-        return self
 
     def close(self) -> None:
+        self._keepalive_stop.set()
         if self.si is not None:
             try:
                 Disconnect(self.si)
@@ -165,6 +215,7 @@ class VSphere:
             view.Destroy()
 
     def vm(self, moref: str) -> Any:
+        self.ensure_session()
         obj = vim.VirtualMachine(moref, self.si._stub)
         try:
             obj.name  # noqa: B018 - existence check
@@ -323,6 +374,8 @@ class VSphere:
                                  self._disks_from_devices(snap.config.hardware.device))
 
     def remove_snapshot(self, snap: Any) -> None:
+        self.ensure_session()
+        snap = self.rebind(snap)
         self.wait(snap.RemoveSnapshot_Task(removeChildren=False, consolidate=True),
                   timeout=6 * 3600)
 
