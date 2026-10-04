@@ -428,8 +428,12 @@ class VolumeRestore:
             self.ctx.item(pvc, kind="volume", state="running")
             try:
                 produce = self._producer(pvc, block, disks[pvc]["key"])
-                run_mover(self.kube, self.ns, pvc, block, image, settings.mover_url, ca_pem,
-                          settings.data_dir, produce, self.ctx)
+                base_url, address = settings.mover_endpoint()
+                if pvc == wanted[0]["metadata"]["name"]:
+                    self.ctx.log(f"Mover pods fetch data from {base_url}"
+                                 + (f" at {address}" if address else ""))
+                run_mover(self.kube, self.ns, pvc, block, image, base_url, ca_pem,
+                          settings.data_dir, produce, self.ctx, address=address)
                 self.ctx.item(pvc, state="success")
                 self.ctx.log(f"Volume {pvc} restored")
             except Exception as e:

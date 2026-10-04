@@ -200,3 +200,27 @@ def test_platform_kinds_are_quiet_app_kinds_warn(tmp_path):
     assert levels.get("platform") == "info"
     assert any(lvl == "warning" and "servicemonitors" in m for lvl, m in ctx.messages)
     repo.close()
+
+
+def test_mover_pins_the_certificate_name_to_an_address(tmp_path, monkeypatch):
+    import subprocess
+
+    from openbackup.config import Settings
+    from openbackup.kube.mover import pod_spec
+
+    cert = tmp_path / "tls.crt"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-keyout", str(tmp_path / "k"), "-out", str(cert),
+                    "-subj", "/CN=openbackup.example",
+                    "-addext", "subjectAltName=DNS:openbackup.example,DNS:openbackup"],
+                   check=True, capture_output=True)
+    s = Settings(tls_cert_file=cert, public_address="192.0.2.10")
+    url, address = s.mover_endpoint()
+    assert url == "https://openbackup.example:8443" and address == "192.0.2.10"
+    pod = pod_spec("p", "ns", "data", False, "img", f"{url}/api/mover/x", "tok", "CA", address)
+    script = pod["spec"]["containers"][0]["command"][2]
+    assert "--resolve openbackup.example:8443:192.0.2.10" in script
+    assert "--cacert /tmp/ca.pem" in script  # still verified, under the certificate's name
+    # An explicit public URL uses DNS as configured.
+    s2 = Settings(tls_cert_file=cert, public_url="https://backup.corp:9443/")
+    assert s2.mover_endpoint() == ("https://backup.corp:9443", None)

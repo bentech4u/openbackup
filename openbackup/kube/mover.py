@@ -25,6 +25,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ..engine.context import TaskContext, check_cancel
 from .client import KubeClient, KubeError
@@ -116,9 +117,15 @@ def resolve_image(c: KubeClient, override: str | None) -> str:
 
 
 def pod_spec(name: str, namespace: str, pvc: str, block: bool, image: str, url: str,
-             token: str, ca_pem: str) -> dict:
+             token: str, ca_pem: str, address: str | None = None) -> dict:
+    # With an address, the URL's host name is pinned to it (no DNS lookup);
+    # the certificate is still verified under that name.
+    resolve = ""
+    if address:
+        u = urlsplit(url)
+        resolve = f"--resolve {u.hostname}:{u.port or 443}:{address} "
     fetch = ('printf "%s" "$OB_CA" > /tmp/ca.pem && '
-             'curl --fail --silent --show-error --cacert /tmp/ca.pem '
+             f'curl --fail --silent --show-error {resolve}--cacert /tmp/ca.pem '
              '-H "Authorization: Bearer $OB_TOKEN" "$OB_URL"')
     if block:
         script = f"set -o pipefail; {fetch} | dd of=/dev/obdata bs=4M conv=fsync status=none"
@@ -157,12 +164,12 @@ def pod_spec(name: str, namespace: str, pvc: str, block: bool, image: str, url: 
 
 def run_mover(c: KubeClient, namespace: str, pvc: str, block: bool, image: str, base_url: str,
               ca_pem: str, data_dir: Path, produce: Callable[[Path], None], ctx: TaskContext,
-              start_timeout: float = 900, poll: float = 2.0) -> None:
+              start_timeout: float = 900, poll: float = 2.0, address: str | None = None) -> None:
     """Create the mover pod, feed it with ``produce(fifo)`` and wait for it."""
     ch = open_channel(data_dir)
     name = f"openbackup-restore-{pvc}"[:52] + "-" + secrets.token_hex(3)
     pod = pod_spec(name, namespace, pvc, block, image, f"{base_url}/api/mover/{ch.id}",
-                   ch.token, ca_pem)
+                   ch.token, ca_pem, address)
     pod_path = f"/api/v1/namespaces/{namespace}/pods/{name}"
     produced: dict = {}
 
