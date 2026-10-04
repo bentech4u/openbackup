@@ -55,9 +55,12 @@ class JobOut(ORM):
     id: int
     name: str
     description: str
-    vcenter_id: int
+    kind: str = "vsphere"
+    vcenter_id: int | None
+    cluster_id: int | None = None
     repository_id: int
     vms: list
+    selection: dict = {}
     schedule_cron: str | None
     enabled: bool
     retention_points: int
@@ -109,6 +112,7 @@ class RestorePointOut(ORM):
     id: str
     repository_id: int
     job_id: int | None
+    subject_kind: str = "vm"
     vm_uuid: str
     vm_name: str
     vm_moref: str

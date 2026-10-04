@@ -9,7 +9,6 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..config import get_settings
-from .models import Base
 
 
 def make_engine(url: str) -> Engine:
@@ -43,7 +42,10 @@ def get_sessionmaker() -> sessionmaker[Session]:
 
 
 def init_db(engine: Engine | None = None) -> None:
-    Base.metadata.create_all(engine or get_engine())
+    """Bring the schema up to date (creating it on a new database)."""
+    from .migrate import upgrade
+
+    upgrade(engine or get_engine())
 
 
 @contextmanager

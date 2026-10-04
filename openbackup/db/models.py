@@ -155,6 +155,32 @@ class DatastoreAccess(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class KubeCluster(Base):
+    """An OpenShift / Kubernetes cluster. The API server is trusted through a
+    pinned CA bundle, never the system trust store."""
+
+    __tablename__ = "kube_clusters"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    api_url: Mapped[str] = mapped_column(String(512))
+    ca_pem: Mapped[str] = mapped_column(Text)
+    # Read-only ServiceAccount token used for backups.
+    backup_token_enc: Mapped[str] = mapped_column(Text)
+    # Optional stored credential for restores; otherwise entered per restore.
+    restore_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The vCenter backing vSphere CSI volumes, for persistent-volume data.
+    vcenter_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vcenters.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class JobKind(enum.StrEnum):
+    vsphere = "vsphere"
+    openshift = "openshift"
+    etcd = "etcd"
+
+
 class RepoKind(enum.StrEnum):
     local = "local"
     nfs = "nfs"
@@ -184,10 +210,18 @@ class Job(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
     description: Mapped[str] = mapped_column(Text, default="")
-    vcenter_id: Mapped[int] = mapped_column(ForeignKey("vcenters.id"))
+    kind: Mapped[JobKind] = mapped_column(Enum(JobKind, native_enum=False),
+                                          default=JobKind.vsphere,
+                                          server_default=JobKind.vsphere.value)
+    vcenter_id: Mapped[int | None] = mapped_column(ForeignKey("vcenters.id"), nullable=True)
+    cluster_id: Mapped[int | None] = mapped_column(
+        ForeignKey("kube_clusters.id"), nullable=True)
     repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id"))
-    # [{"moref": "vm-123", "name": "web01"}]
+    # vsphere: [{"moref": "vm-123", "name": "web01"}]
     vms: Mapped[list] = mapped_column(JSON, default=list)
+    # openshift: {"namespaces": [...], "freeze_vms": bool}
+    # etcd:      {"source": {...}}
+    selection: Mapped[dict] = mapped_column(JSON, default=dict, server_default="{}")
     schedule_cron: Mapped[str | None] = mapped_column(String(128), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     retention_points: Mapped[int] = mapped_column(Integer, default=14)
@@ -199,7 +233,8 @@ class Job(Base):
     next_run_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_run_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-    vcenter: Mapped[VCenter] = relationship()
+    vcenter: Mapped[VCenter | None] = relationship()
+    cluster: Mapped[KubeCluster | None] = relationship()
     repository: Mapped[Repository] = relationship()
 
 
@@ -281,6 +316,9 @@ class RestorePoint(Base):
     job_id: Mapped[int | None] = mapped_column(
         ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # What was backed up: a VM, an OpenShift namespace or an etcd backup set.
+    # vm_uuid/vm_name hold that subject's stable id and display name.
+    subject_kind: Mapped[str] = mapped_column(String(16), default="vm", server_default="vm")
     vm_uuid: Mapped[str] = mapped_column(String(64), index=True)
     vm_name: Mapped[str] = mapped_column(String(255))
     vm_moref: Mapped[str] = mapped_column(String(64), default="")

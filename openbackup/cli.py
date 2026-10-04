@@ -39,6 +39,14 @@ def cmd_init(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_db_upgrade(_args: argparse.Namespace) -> int:
+    from .db import init_db
+
+    init_db()
+    print("Database schema is up to date")
+    return 0
+
+
 def cmd_user_create(args: argparse.Namespace) -> int:
     from .auth.passwords import hash_password
     from .db import init_db, session_scope
@@ -125,6 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the secret key and database").set_defaults(func=cmd_init)
+    dbp = sub.add_parser("db", help="database maintenance").add_subparsers(dest="dcmd",
+                                                                           required=True)
+    dbp.add_parser("upgrade", help="apply schema migrations").set_defaults(func=cmd_db_upgrade)
 
     user = sub.add_parser("user", help="manage web users").add_subparsers(dest="ucmd",
                                                                           required=True)
