@@ -10,6 +10,7 @@ from ..db import init_db
 from .routers import (
     audit,
     auth,
+    clusters,
     dashboard,
     datastores,
     flr,
@@ -53,8 +54,8 @@ def create_app(*, create_tables: bool = True) -> FastAPI:
             response.headers.setdefault("Cache-Control", "no-store")
         return response
 
-    for r in (auth, users, audit, vcenters, inventory, datastores, repositories, jobs, tasks,
-              points, flr, dashboard):
+    for r in (auth, users, audit, vcenters, inventory, datastores, clusters, repositories, jobs,
+              tasks, points, flr, dashboard):
         app.include_router(r.router)
 
     @app.get("/api/health", include_in_schema=False)

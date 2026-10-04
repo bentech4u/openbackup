@@ -13,6 +13,7 @@ import Tasks, { TaskDetail } from "./pages/Tasks";
 import Restore, { PointPage } from "./pages/Restore";
 import FileBrowser from "./pages/FileBrowser";
 import VCenters from "./pages/VCenters";
+import Clusters from "./pages/Clusters";
 import Repositories from "./pages/Repositories";
 import Users from "./pages/Users";
 import Audit from "./pages/Audit";
@@ -45,6 +46,7 @@ function Gate() {
         <Route path="points/:id" element={<PointPage />} />
         <Route path="points/:id/files" element={<FileBrowser />} />
         <Route path="vcenters" element={<VCenters />} />
+        <Route path="clusters" element={<Clusters />} />
         <Route path="repositories" element={<Repositories />} />
         {can("admin") && <Route path="users" element={<Users />} />}
         {can("admin") && <Route path="audit" element={<Audit />} />}

@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom";
 import {
+  Boxes,
   Briefcase,
   Database,
   History,
@@ -38,6 +39,9 @@ export default function Layout() {
           <div className="nav-section">Infrastructure</div>
           <NavLink to="/vcenters">
             <Server size={17} /> vCenters
+          </NavLink>
+          <NavLink to="/clusters">
+            <Boxes size={17} /> OpenShift
           </NavLink>
           <NavLink to="/repositories">
             <Database size={17} /> Repositories
