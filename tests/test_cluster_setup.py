@@ -131,3 +131,25 @@ def test_update_permissions_on_existing_cluster(admin_api, cluster, ca_pem):  # 
     r = admin_api.post(f"/api/clusters/{cid}/permissions",
                        json={"admin": {"kind": "token", "token": "nobody"}})
     assert r.status_code == 400
+
+
+def test_reading_secrets_is_a_separate_grant(admin_api, cluster, ca_pem):  # noqa: F811
+    crb = ("rbac.authorization.k8s.io", "clusterrolebindings", "",
+           "openbackup-backup-read-secrets")
+    r = admin_api.post("/api/clusters/setup",
+                       json={**_body(ca_pem, kind="token", token="pasted-admin-token"),
+                             "read_secrets": False})
+    cid = r.json()["cluster"]["id"]
+    assert cluster.get_obj(*crb) is None
+    r = admin_api.post(f"/api/clusters/{cid}/permissions",
+                       json={"admin": {"kind": "token", "token": "pasted-admin-token"},
+                             "read_secrets": True})
+    assert r.status_code == 200 and cluster.get_obj(*crb)
+    # Leaving it unspecified keeps it; false removes it again.
+    admin_api.post(f"/api/clusters/{cid}/permissions",
+                   json={"admin": {"kind": "token", "token": "pasted-admin-token"}})
+    assert cluster.get_obj(*crb)
+    admin_api.post(f"/api/clusters/{cid}/permissions",
+                   json={"admin": {"kind": "token", "token": "pasted-admin-token"},
+                         "read_secrets": False})
+    assert cluster.get_obj(*crb) is None

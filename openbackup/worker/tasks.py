@@ -237,8 +237,9 @@ def _run_openshift_backup(task_id, task, job, repo_row, vc, ctx) -> tuple[TaskSt
                     raise Cancelled()
                 ctx.item(ns, state="running")
                 scoped = ScopedContext(ctx, i, len(wanted), 0)
-                opts = NamespaceBackupOptions(cluster.id, cluster.name, cluster.api_url,
-                                              job.id, job.name, task_id)
+                opts = NamespaceBackupOptions(
+                    cluster.id, cluster.name, cluster.api_url, job.id, job.name, task_id,
+                    include_secrets=bool(job.selection.get("include_secrets")))
                 prev = latest_point_for_vm(repo, subject_id(cluster.name, ns))
                 freeze = job.selection.get("freeze_vms", True)
                 volumes = volume_backup(
@@ -464,7 +465,8 @@ def _restore_namespace(p, repo, ctx) -> tuple[TaskState, str]:
     opts = NamespaceRestoreOptions(
         target_namespace=o["target_namespace"], storage_class_map=o.get("storage_class_map", {}),
         route_host_map=o.get("route_host_map", {}), keep_uid_range=o.get("keep_uid_range", True),
-        merge=o.get("merge", False), include_data=o.get("include_data", True))
+        merge=o.get("merge", False), include_data=o.get("include_data", True),
+        restore_secrets=o.get("restore_secrets", True))
     kube = kube_client_factory(cluster.api_url, decrypt(token_enc), cluster.ca_pem)
     vr = VolumeRestore(kube, repo, p["point_id"], opts.target_namespace, ctx)
     try:

@@ -29,6 +29,8 @@ class OpenShiftSelection(BaseModel):
     namespaces: list[str] = Field(min_length=1, max_length=500)
     # Freeze KubeVirt guests (QEMU guest agent) while their disks are snapshotted.
     freeze_vms: bool = True
+    # Back up Secrets too; only into encrypted repositories.
+    include_secrets: bool = False
 
     @field_validator("namespaces")
     @classmethod
@@ -124,8 +126,14 @@ def _check_refs(db: Session, body: JobIn) -> None:
         if cluster is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown cluster")
         body.vcenter_id = cluster.vcenter_id
-    if db.get(Repository, body.repository_id) is None:
+    repo = db.get(Repository, body.repository_id)
+    if repo is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unknown repository")
+    if body.kind == JobKind.openshift and body.selection.get("include_secrets") \
+            and not repo.encrypted:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"Secrets are only backed up into encrypted repositories, and "
+                            f"{repo.name} is not encrypted. Choose or create an encrypted one.")
     if body.retention_points == 0 and body.retention_days == 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             "Set a retention by number of points or by days")

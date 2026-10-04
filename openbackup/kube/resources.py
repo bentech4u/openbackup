@@ -17,7 +17,6 @@ from .client import KubeClient, KubeError
 EXCLUDED_TYPES = {
     ("", "events"), ("events.k8s.io", "events"),
     ("", "endpoints"), ("discovery.k8s.io", "endpointslices"),
-    ("", "secrets"),
     ("apps", "controllerrevisions"),
     ("coordination.k8s.io", "leases"),
     ("metrics.k8s.io", "pods"),
@@ -45,6 +44,24 @@ APP_LEVEL_RESTRICTED = {
     ("monitoring.openshift.io", "alertrelabelconfigs"),
     ("config.openshift.io", "imagepolicies"),
 }
+
+# Secrets the platform creates and recreates by itself (service account
+# tokens, internal registry pull secrets); never part of a backup.
+GENERATED_SECRET_TYPES = {"kubernetes.io/service-account-token"}
+GENERATED_SECRET_ANNOTATIONS = ("kubernetes.io/service-account.name",
+                                "openshift.io/internal-registry-auth-token.service-account")
+
+
+def generated_secret(obj: dict) -> bool:
+    if obj.get("type") in GENERATED_SECRET_TYPES:
+        return True
+    ann = obj["metadata"].get("annotations") or {}
+    return any(a in ann for a in GENERATED_SECRET_ANNOTATIONS)
+
+
+class SecretsNotReadable(KubeError):
+    pass
+
 
 # Injected into every namespace by the platform.
 GENERATED_CONFIGMAPS = {"kube-root-ca.crt", "openshift-service-ca.crt"}
@@ -112,8 +129,10 @@ def clean(obj: dict) -> dict:
     return o
 
 
-def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
-    """Everything needed to recreate ``namespace``, as plain JSON."""
+def capture_namespace(c: KubeClient, namespace: str,
+                      include_secrets: bool = False) -> dict[str, Any]:
+    """Everything needed to recreate ``namespace``, as plain JSON. Secrets
+    only when asked for (the repository must then be encrypted)."""
     ns_obj = c.get(f"/api/v1/namespaces/{namespace}")
     objects: list[dict] = []
     skipped: list[str] = []  # app-level kinds that could not be read
@@ -123,9 +142,17 @@ def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
             continue
         if (r.group, r.plural) in EXCLUDED_TYPES:
             continue
+        is_secrets = (r.group, r.plural) == ("", "secrets")
+        if is_secrets and not include_secrets:
+            continue
         try:
             items = c.list(r.path(namespace))
         except KubeError as e:
+            if is_secrets and e.status == 403:
+                raise SecretsNotReadable(
+                    "The backup account cannot read Secrets. On the OpenShift page, select the "
+                    "cluster, choose Update permissions and allow reading Secrets.", 403) \
+                    from None
             if e.status == 403 and (r.group, r.plural) not in APP_LEVEL_RESTRICTED:
                 platform.append(f"{r.plural}.{r.group or 'core'}")
                 continue
@@ -139,6 +166,8 @@ def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
             if owned(item):
                 continue
             if r.kind == "ConfigMap" and item["metadata"]["name"] in GENERATED_CONFIGMAPS:
+                continue
+            if is_secrets and generated_secret(item):
                 continue
             objects.append(clean(item))
 
@@ -177,7 +206,7 @@ def capture_namespace(c: KubeClient, namespace: str) -> dict[str, Any]:
 
 ORDER = [
     {"ServiceAccount", "Role", "RoleBinding", "LimitRange", "ResourceQuota", "NetworkPolicy"},
-    {"ConfigMap", "ImageStream"},
+    {"ConfigMap", "Secret", "ImageStream"},
     {"PersistentVolumeClaim"},
     {"Service"},
     {"Deployment", "StatefulSet", "DaemonSet", "DeploymentConfig", "ReplicaSet",
@@ -201,7 +230,8 @@ def rank(obj: dict) -> int:
 def plan_restore(captured: dict, target_namespace: str, *,
                  storage_class_map: dict[str, str] | None = None,
                  route_host_map: dict[str, str] | None = None,
-                 keep_uid_range: bool = True) -> tuple[dict, list[dict]]:
+                 keep_uid_range: bool = True,
+                 restore_secrets: bool = True) -> tuple[dict, list[dict]]:
     """The Namespace object and the ordered objects to apply into it."""
     source = captured["namespace"]["metadata"]["name"]
     scm = storage_class_map or {}
@@ -218,6 +248,8 @@ def plan_restore(captured: dict, target_namespace: str, *,
 
     out = []
     for o in captured["objects"]:
+        if o["kind"] == "Secret" and not restore_secrets:
+            continue
         o = copy.deepcopy(o)
         o["metadata"]["namespace"] = target_namespace
         kind = o["kind"]

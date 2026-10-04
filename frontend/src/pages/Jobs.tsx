@@ -235,6 +235,7 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
   const [clusterId, setClusterId] = useState(job?.cluster_id ?? clusters[0]?.id ?? 0);
   const [namespaces, setNamespaces] = useState<Set<string>>(new Set((job?.selection?.namespaces as string[]) ?? []));
   const [freezeVms, setFreezeVms] = useState<boolean>((job?.selection?.freeze_vms as boolean) ?? true);
+  const [includeSecrets, setIncludeSecrets] = useState<boolean>((job?.selection?.include_secrets as boolean) ?? false);
   const [step, setStep] = useState(0);
   const [name, setName] = useState(job?.name ?? "");
   const [description, setDescription] = useState(job?.description ?? "");
@@ -278,6 +279,8 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
     if (s === 1 && kind === "openshift" && namespaces.size === 0) return "Select at least one namespace";
     if (s === 1 && kind === "etcd" && (!etcdSrc.server.trim() || !etcdSrc.export.trim())) return "Enter the NFS server and export";
     if (s === 2 && !repoId) return "Choose a repository";
+    if (s === 2 && kind === "openshift" && includeSecrets && !repositories.find((r) => r.id === repoId)?.encrypted)
+      return "Secrets are only backed up into encrypted repositories: choose an encrypted repository, or untick Include Secrets";
     if (s === 2 && !points && !days) return "Keep restore points by count, by days, or both";
     if (s === 3 && schedKind === "weekly" && weekDays.length === 0) return "Pick at least one day";
     return "";
@@ -302,7 +305,7 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
       vms: kind === "vsphere" ? [...selected].map(([moref, n]) => ({ moref, name: n })) : [],
       selection:
         kind === "openshift"
-          ? { namespaces: [...namespaces], freeze_vms: freezeVms }
+          ? { namespaces: [...namespaces], freeze_vms: freezeVms, include_secrets: includeSecrets }
           : kind === "etcd"
             ? { source: { ...etcdSrc, server: etcdSrc.server.trim(), export: etcdSrc.export.trim(), path: etcdSrc.path.trim() } }
             : {},
@@ -466,7 +469,17 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
                 </table>
               )}
             </div>
-            <div className="muted small">Secrets are never backed up. Restored applications need their Secrets recreated.</div>
+            <label className="check">
+              <input type="checkbox" checked={includeSecrets} onChange={(e) => setIncludeSecrets(e.target.checked)} />
+              <span>
+                Include Secrets
+                <div className="muted small">
+                  Passwords, keys and certificates the applications need. Only allowed into an encrypted repository, and the backup
+                  account must be allowed to read Secrets (OpenShift page → Update permissions). Service account tokens are never
+                  included; OpenShift recreates them.
+                </div>
+              </span>
+            </label>
           </>
         )}
         {step === 1 && kind === "etcd" && (
@@ -638,6 +651,8 @@ function JobEditor({ job, vcenters, repositories, clusters, onClose, onSaved }: 
                 <dd>{clusters.find((c) => c.id === clusterId)?.name}</dd>
                 <dt>Namespaces</dt>
                 <dd>{[...namespaces].join(", ")}</dd>
+                <dt>Secrets</dt>
+                <dd>{includeSecrets ? "included (encrypted repository)" : "not included"}</dd>
               </>
             ) : (
               <>

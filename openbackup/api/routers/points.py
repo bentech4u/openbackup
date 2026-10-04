@@ -88,7 +88,8 @@ async def get_point(point_id: str, db: Session = Depends(get_db),
         out.update(files=m.get("files", []), source_set=m.get("source_set", ""),
                    collected_at=m.get("collected_at"))
     if p.subject_kind == "namespace":
-        out.update(cluster=m.get("cluster", {}), namespace=m.get("namespace", ""),
+        out.update(secrets_included=bool(m.get("secrets_included")),
+                   cluster=m.get("cluster", {}), namespace=m.get("namespace", ""),
                    resources=m.get("resources", {}), pvcs=m.get("pvcs", []),
                    skipped_types=m.get("skipped_types", []))
     return out
@@ -226,6 +227,7 @@ class NamespaceIn(BaseModel):
     keep_uid_range: bool = True
     merge: bool = False
     include_data: bool = True
+    restore_secrets: bool = True
     # Used for this restore only, when the cluster has no stored restore token.
     restore_token: str | None = Field(None, max_length=16384)
 

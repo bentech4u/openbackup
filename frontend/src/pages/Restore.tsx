@@ -557,6 +557,7 @@ interface NamespacePointDetail extends PointDetail {
   resources: Record<string, number>;
   pvcs: { name: string; storage_class: string; size: string; volume_mode: string; data: boolean }[];
   skipped_types: string[];
+  secrets_included?: boolean;
 }
 
 function NamespacePoint({ point: p }: { point: NamespacePointDetail }) {
@@ -603,7 +604,9 @@ function NamespacePoint({ point: p }: { point: NamespacePointDetail }) {
             <dt>Objects</dt>
             <dd>{total}</dd>
             <dt>Secrets</dt>
-            <dd className="muted">not backed up</dd>
+            <dd className={p.secrets_included ? "" : "muted"}>
+              {p.secrets_included ? `${p.resources.Secret ?? 0} backed up (encrypted)` : "not backed up"}
+            </dd>
           </dl>
         </Card>
         <Card title="Objects by kind">
@@ -664,6 +667,7 @@ function NamespaceRestore({ point, onClose }: { point: NamespacePointDetail; onC
   const [merge, setMerge] = useState(false);
   const [keepUid, setKeepUid] = useState(true);
   const [includeData, setIncludeData] = useState(true);
+  const [restoreSecrets, setRestoreSecrets] = useState(true);
   const classes = [...new Set(point.pvcs.map((v) => v.storage_class).filter(Boolean))];
   const [scMap, setScMap] = useState<Record<string, string>>({});
   const [routeFrom, setRouteFrom] = useState("");
@@ -686,6 +690,7 @@ function NamespaceRestore({ point, onClose }: { point: NamespacePointDetail; onC
           keep_uid_range: keepUid,
           merge,
           include_data: includeData,
+          restore_secrets: restoreSecrets,
           restore_token: token.trim() || null,
         },
       });
@@ -771,6 +776,17 @@ function NamespaceRestore({ point, onClose }: { point: NamespacePointDetail; onC
           <input type="checkbox" checked={includeData} onChange={(e) => setIncludeData(e.target.checked)} />
           Restore persistent volume data
         </label>
+        {point.secrets_included ? (
+          <label className="check">
+            <input type="checkbox" checked={restoreSecrets} onChange={(e) => setRestoreSecrets(e.target.checked)} />
+            <span>
+              Restore Secrets ({point.resources.Secret ?? 0})
+              <div className="muted small">Untick if the target already has its own Secrets (for example a DR cluster with different passwords).</div>
+            </span>
+          </label>
+        ) : (
+          <Alert tone="info">This backup has no Secrets. Recreate the application&apos;s Secrets in the target namespace after restoring.</Alert>
+        )}
       </div>
     </Modal>
   );

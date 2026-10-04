@@ -93,6 +93,7 @@ class SetupResult:
 
 
 def setup_accounts(api: KubeClient, with_restore: bool, *,
+                   read_secrets: bool | None = None,
                    wait: Callable[[float], None] = time.sleep) -> SetupResult:
     """Create OpenBackup's namespace and ServiceAccounts with ``api`` (an
     admin client) and return their tokens."""
@@ -113,6 +114,17 @@ def setup_accounts(api: KubeClient, with_restore: bool, *,
         api.apply(_object_path(api, obj), obj)
         if label not in created:
             created.append(label)
+
+    # Reading Secrets is a separate, revocable grant (None: leave as it is).
+    if read_secrets is not None:
+        for obj in manifests("backup-secrets.yaml"):
+            label = f"{obj['kind']}/{obj['metadata']['name']}"
+            if read_secrets:
+                api.apply(_object_path(api, obj), obj)
+                created.append(label)
+            else:
+                api.delete(_object_path(api, obj))
+                skipped.append(f"{label} (reading Secrets not allowed; removed if present)")
 
     def token(secret: str) -> str:
         for _ in range(30):  # the token controller fills the Secret asynchronously

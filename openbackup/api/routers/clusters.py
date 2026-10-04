@@ -172,13 +172,17 @@ class SetupIn(BaseModel):
     admin: AdminAuth
     # Create the restore account too, and keep its token in OpenBackup.
     restore_account: bool = True
+    # Let the backup account read Secrets (for jobs that include them).
+    read_secrets: bool = False
 
 
 def _setup(body: SetupIn) -> tuple[bootstrap.SetupResult, dict, dict | None]:
-    return _run_setup(body.api_url.rstrip("/"), body.ca_pem, body.admin, body.restore_account)
+    return _run_setup(body.api_url.rstrip("/"), body.ca_pem, body.admin, body.restore_account,
+                      body.read_secrets)
 
 
-def _run_setup(api_url: str, ca_pem: str, a: AdminAuth, restore_account: bool
+def _run_setup(api_url: str, ca_pem: str, a: AdminAuth, restore_account: bool,
+               read_secrets: bool | None = None
                ) -> tuple[bootstrap.SetupResult, dict, dict | None]:
     validate_ca_bundle(ca_pem)
     obtained = False
@@ -198,7 +202,8 @@ def _run_setup(api_url: str, ca_pem: str, a: AdminAuth, restore_account: bool
         admin_token = a.token.strip()
     with client_factory(api_url, admin_token, ca_pem) as admin_client:
         try:
-            result = bootstrap.setup_accounts(admin_client, restore_account)
+            result = bootstrap.setup_accounts(admin_client, restore_account,
+                                              read_secrets=read_secrets)
         finally:
             if obtained:  # only the session we created; a pasted token stays the user's
                 try:
@@ -214,6 +219,7 @@ def _run_setup(api_url: str, ca_pem: str, a: AdminAuth, restore_account: bool
 class PermissionsIn(BaseModel):
     admin: AdminAuth
     restore_account: bool | None = None  # default: keep what the cluster has
+    read_secrets: bool | None = None  # default: leave as it is
 
 
 @router.post("/{cid}/permissions")
@@ -226,7 +232,8 @@ async def update_permissions(cid: int, body: PermissionsIn, request: Request,
         else body.restore_account
     try:
         result, backup, restore = await run_in_threadpool(_run_setup, c.api_url, c.ca_pem,
-                                                          body.admin, with_restore)
+                                                          body.admin, with_restore,
+                                                          body.read_secrets)
     except KubeError as e:
         audit(db, request, "cluster.permissions", principal=p, target=c.name, success=False,
               detail={"error": str(e)[:300]})

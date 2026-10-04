@@ -255,6 +255,7 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
   const [oauthChain, setOauthChain] = useState<ChainCert[] | null>(null);
   const [oauthCa, setOauthCa] = useState("");
   const [restoreAccount, setRestoreAccount] = useState(true);
+  const [readSecrets, setReadSecrets] = useState(false);
   const [result, setResult] = useState<{
     backup: Probe;
     restore: Probe | null;
@@ -326,6 +327,7 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
         api_url: url.trim(),
         ca_pem: caPem,
         restore_account: restoreAccount,
+        read_secrets: readSecrets,
         admin:
           adminKind === "password"
             ? { kind: "password", username: username.trim(), password, oauth_ca_pem: oauthCa }
@@ -496,6 +498,13 @@ function AddCluster({ onClose, onDone }: { onClose: () => void; onDone: () => vo
                 </Field>
               )}
               <label className="check">
+                <input type="checkbox" checked={readSecrets} onChange={(e) => setReadSecrets(e.target.checked)} />
+                <span>
+                  Allow the backup account to read Secrets
+                  <div className="muted small">Needed for jobs that include Secrets. Can be removed again later.</div>
+                </span>
+              </label>
+              <label className="check">
                 <input type="checkbox" checked={restoreAccount} onChange={(e) => setRestoreAccount(e.target.checked)} />
                 <span>
                   Also create the restore account and keep its token
@@ -643,6 +652,7 @@ function LinkVCenter({ cluster, onClose, onDone }: { cluster: Cluster; onClose: 
 
 function UpdatePermissions({ cluster, onClose }: { cluster: Cluster; onClose: () => void }) {
   const [kind, setKind] = useState<"password" | "token">("password");
+  const [secrets, setSecrets] = useState<"keep" | "allow" | "remove">("keep");
   const [username, setUsername] = useState("kubeadmin");
   const [password, setPassword] = useState("");
   const [token, setToken] = useState("");
@@ -674,6 +684,7 @@ function UpdatePermissions({ cluster, onClose }: { cluster: Cluster; onClose: ()
       const r = await post<{ admin_user: string; created: string[]; backup: Probe; restore: Probe | null }>(
         `/api/clusters/${cluster.id}/permissions`,
         {
+          read_secrets: secrets === "keep" ? null : secrets === "allow",
           admin:
             kind === "password"
               ? { kind: "password", username: username.trim(), password, oauth_ca_pem: oauthCa }
@@ -729,6 +740,13 @@ function UpdatePermissions({ cluster, onClose }: { cluster: Cluster; onClose: ()
           existing tokens stay valid. Admin credentials are used once and not stored.
         </div>
         <Alert>{error}</Alert>
+        <Field label="Reading Secrets" hint="Jobs that include Secrets need this. They are only stored in encrypted repositories.">
+          <select value={secrets} onChange={(e) => setSecrets(e.target.value as "keep" | "allow" | "remove")}>
+            <option value="keep">Leave as it is</option>
+            <option value="allow">Allow the backup account to read Secrets</option>
+            <option value="remove">Do not allow (remove the permission)</option>
+          </select>
+        </Field>
         <div className="segmented">
           <button type="button" className={kind === "password" ? "on" : ""} onClick={() => setKind("password")}>
             Username and password

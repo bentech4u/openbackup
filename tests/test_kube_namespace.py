@@ -224,3 +224,62 @@ def test_mover_pins_the_certificate_name_to_an_address(tmp_path, monkeypatch):
     # An explicit public URL uses DNS as configured.
     s2 = Settings(tls_cert_file=cert, public_url="https://backup.corp:9443/")
     assert s2.mover_endpoint() == ("https://backup.corp:9443", None)
+
+
+def _with_generated_secrets(fk, ns="shop"):
+    fk.add({"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/service-account-token",
+            "metadata": {"name": "app-token-x", "namespace": ns,
+                         "annotations": {"kubernetes.io/service-account.name": "app"}}})
+    fk.add({"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/dockercfg",
+            "metadata": {"name": "app-dockercfg-x", "namespace": ns, "annotations": {
+                "openshift.io/internal-registry-auth-token.service-account": "app"}}})
+
+
+def test_secrets_only_when_asked_and_never_generated_ones(src):
+    fk, c = src
+    _with_generated_secrets(fk)
+    assert not any(o["kind"] == "Secret" for o in capture_namespace(c, "shop")["objects"])
+    cap = capture_namespace(c, "shop", include_secrets=True)
+    secrets = {o["metadata"]["name"]: o for o in cap["objects"] if o["kind"] == "Secret"}
+    assert set(secrets) == {"db-password"}
+    assert secrets["db-password"]["data"] == {"p": "c2VjcmV0"}
+
+
+def test_unreadable_secrets_fail_clearly(src):
+    from openbackup.kube.resources import SecretsNotReadable
+
+    fk, c = src
+    fk.denied.add(("list", "secrets"))
+    with pytest.raises(SecretsNotReadable, match="Update permissions"):
+        capture_namespace(c, "shop", include_secrets=True)
+
+
+def test_secrets_need_an_encrypted_repository_and_restore_first(src, tmp_path):
+    fk, c = src
+    plain = Repository.create(tmp_path / "plain", tmp_path / "idx")
+    with pytest.raises(ValueError, match="encrypted"):
+        backup_namespace(c, plain, "shop",
+                         NamespaceBackupOptions(1, "h", "u", include_secrets=True), NullContext())
+    assert plain.point_ids() == []
+    plain.close()
+
+    repo = Repository.create(tmp_path / "enc", tmp_path / "idx", passphrase="secret passphrase")
+    m = backup_namespace(c, repo, "shop", NamespaceBackupOptions(1, "h", "u",
+                                                                 include_secrets=True),
+                         NullContext())
+    assert m["resources"]["Secret"] == 1 and m["secrets_included"]
+    for p in (tmp_path / "enc").rglob("*"):  # the value is not readable on the share
+        if p.is_file():
+            assert b"c2VjcmV0" not in p.read_bytes()
+    _ns, objs = plan_restore(json.loads(read_blob(repo, m["id"], RESOURCES_KEY)), "x")
+    kinds = [o["kind"] for o in objs]
+    assert kinds.index("Secret") < kinds.index("Deployment")
+
+    dr = FakeKube()
+    dc = KubeClient("https://dr:6443", "t", "", transport=dr.transport())
+    restore_namespace(dc, repo, m["id"], NamespaceRestoreOptions("shop"), NullContext())
+    assert dr.get_obj("", "secrets", "shop", "db-password")["data"] == {"p": "c2VjcmV0"}
+    restore_namespace(dc, repo, m["id"], NamespaceRestoreOptions("shop2", restore_secrets=False),
+                      NullContext())
+    assert dr.get_obj("", "secrets", "shop2", "db-password") is None
+    repo.close()

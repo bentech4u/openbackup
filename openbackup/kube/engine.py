@@ -46,6 +46,7 @@ class NamespaceBackupOptions:
     job_id: int | None = None
     job_name: str = ""
     task_id: int | None = None
+    include_secrets: bool = False
 
 
 def backup_namespace(c: KubeClient, repo: Repository, namespace: str,
@@ -57,7 +58,10 @@ def backup_namespace(c: KubeClient, repo: Repository, namespace: str,
     now = datetime.now(UTC)
     name = f"{opts.cluster_name}/{namespace}"
     ctx.log(f"{name}: reading API objects")
-    captured = capture_namespace(c, namespace)
+    if opts.include_secrets and not repo.codec.encrypted:
+        # Enforced here as well as when the job is saved.
+        raise ValueError("Secrets are only backed up into encrypted repositories")
+    captured = capture_namespace(c, namespace, include_secrets=opts.include_secrets)
     counts = summarize(captured)
     ctx.log(f"{name}: {sum(counts.values())} objects "
             f"({', '.join(f'{v} {k}' for k, v in counts.items()) or 'none'})")
@@ -102,6 +106,7 @@ def backup_namespace(c: KubeClient, repo: Repository, namespace: str,
         "cluster": {"id": opts.cluster_id, "name": opts.cluster_name, "api_url": opts.api_url},
         "namespace": namespace,
         "resources": counts,
+        "secrets_included": opts.include_secrets,
         "skipped_types": captured["skipped_types"],
         "pvcs": pvcs,
         "disks": disks,
@@ -129,6 +134,7 @@ class NamespaceRestoreOptions:
     keep_uid_range: bool = True
     merge: bool = False  # restore into an existing namespace
     include_data: bool = True
+    restore_secrets: bool = True
 
 
 @dataclass
@@ -147,7 +153,8 @@ def restore_namespace(c: KubeClient, repo: Repository, point_id: str,
     ns, objects = plan_restore(captured, opts.target_namespace,
                                storage_class_map=opts.storage_class_map,
                                route_host_map=opts.route_host_map,
-                               keep_uid_range=opts.keep_uid_range)
+                               keep_uid_range=opts.keep_uid_range,
+                               restore_secrets=opts.restore_secrets)
     res = NamespaceRestoreResult()
     target = opts.target_namespace
 

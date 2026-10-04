@@ -497,3 +497,33 @@ def test_delete_selected_points(admin_api, setup):
     assert [p["id"] for p in admin_api.get("/api/points").json()] == [newer["id"]]
     r = admin_api.post("/api/points/delete", json={"point_ids": ["nope"]})
     assert r.status_code == 404
+
+
+def test_secrets_jobs_require_an_encrypted_repository(admin_api, setup, tmp_path, monkeypatch):
+    import subprocess
+
+    from fake_kube import FakeKube
+
+    from openbackup.api.routers import clusters
+    from openbackup.kube.client import KubeClient
+
+    fk = FakeKube()
+    monkeypatch.setattr(clusters, "client_factory",
+                        lambda url, token, ca, **kw: KubeClient(url, token, ca,
+                                                                transport=fk.transport()))
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-keyout", str(tmp_path / "k"), "-out", str(tmp_path / "c"),
+                    "-subj", "/CN=ca", "-addext", "basicConstraints=critical,CA:TRUE"],
+                   check=True, capture_output=True)
+    cid = admin_api.post("/api/clusters", json={
+        "name": "h", "api_url": "https://api.h:6443", "ca_pem": (tmp_path / "c").read_text(),
+        "backup_token": "t"}).json()["cluster"]["id"]
+    plain = admin_api.post("/api/repositories", json={
+        "name": "plain", "kind": "local", "path": str(tmp_path / "plain")}).json()["id"]
+    body = {"name": "ocp", "kind": "openshift", "cluster_id": cid, "repository_id": plain,
+            "selection": {"namespaces": ["shop"], "include_secrets": True}}
+    r = admin_api.post("/api/jobs", json=body)
+    assert r.status_code == 400 and "encrypted" in r.json()["detail"]
+    # setup["repo_id"] is encrypted
+    r = admin_api.post("/api/jobs", json={**body, "repository_id": setup["repo_id"]})
+    assert r.status_code == 201 and r.json()["selection"]["include_secrets"] is True
